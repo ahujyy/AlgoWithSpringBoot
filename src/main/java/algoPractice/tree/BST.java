@@ -1,4 +1,4 @@
-package algoPractice;
+package algoPractice.tree;
 
 public class BST {
 
