@@ -1,0 +1,91 @@
+#### 计算实时 Top K 热点
+1，先用
+
+clicks
+    .keyBy(event -> event.productId)
+    .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5)))
+    .aggregate(
+        new AggregateFunction<ClickEvent, Long, Long>() {
+            @Override public Long createAccumulator() { return 0L; }
+            @Override public Long add(ClickEvent value, Long acc) { return acc + 1; }
+            @Override public Long getResult(Long acc) { return acc; }
+            @Override public Long merge(Long a, Long b) { return a + b; }
+        },
+        new ProcessWindowFunction<Long, String, String, TimeWindow>() {
+          
+        }
+    )
+
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import java.util.*;
+
+/**
+ * 输入数据格式：WindowResult (skuId, clickCount, windowEnd)
+ */
+public class TopNKeyedProcessFunction extends KeyedProcessFunction<Long, WindowResult, String> {
+
+    // 真正硬核的状态：用来缓存当前这个窗口时间（windowEnd）下，所有 Sku 的点击量快照
+    // 它是免死金牌，防止节点挂了堆内存丢失
+    private transient MapState<String, Long> skuSizeState;
+
+    @Override
+    public void open(Configuration parameters) {
+        skuSizeState = getRuntimeContext().getMapState(
+            new MapStateDescriptor<>("sku-size-state", String.class, Long.class)
+        );
+    }
+
+    @Override
+    public void processElement(WindowResult input, Context ctx, Collector<String> out) throws Exception {
+        // 1. 将当前窗口发来的各个 Sku 数据，暂存到 Flink 状态里
+        skuSizeState.put(input.getSkuId(), input.getClickCount());
+
+        // 2. 注册一个 1 毫秒后的定时器。
+        // 为什么要注册定时器？为了等这个窗口里的所有 Sku 数量“到齐了”，再统一用堆排序，避免来一条算一条。
+        ctx.timerService().registerEventTimeTimer(input.getWindowEnd() + 1);
+    }
+
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
+        long windowEnd = ctx.getCurrentKey(); // 当前触发的窗口结束时间
+
+        // 3. 构建一个 Java 原生的最小堆（PriorityQueue 默认是最小堆，堆顶是小元素）
+        // 里面存的就是 Top 10 的 SKU 实体
+        PriorityQueue<WindowResult> minHeap = new PriorityQueue<>(10, Comparator.comparingLong(WindowResult::getClickCount));
+
+        // 4. 遍历状态，把所有的 SKU 往最小堆里塞
+        Iterable<Map.Entry<String, Long>> allSkus = skuSizeState.entries();
+        for (Map.Entry<String, Long> entry : allSkus) {
+            WindowResult item = new WindowResult(entry.getKey(), entry.getValue(), windowEnd);
+            
+            if (minHeap.size() < 10) {
+                // 堆没满，直接塞
+                minHeap.add(item);
+            } else if (item.getClickCount() > minHeap.peek().getClickCount()) {
+                // 超过了堆顶的“守门员”，把守门员踢走，自己进去
+                minHeap.poll();
+                minHeap.add(item);
+            }
+        }
+
+        // 5. 此时最小堆里留下的，就是真正的全局前 10 名。把它倒序倒出来（变成大到小排列）
+        List<WindowResult> resultList = new ArrayList<>(minHeap);
+        resultList.sort((o1, o2) -> Long.compare(o2.getClickCount(), o1.getClickCount())); // 降序
+
+        // 6. 格式化输出吐给下游（比如 Redis 或者大屏）
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== 窗口结束时间: ").append(new Date(windowEnd)).append(" 的 Top 10 ===\n");
+        for (int i = 0; i < resultList.size(); i++) {
+            WindowResult r = resultList.get(i);
+            sb.append("No.").append(i + 1).append(": Sku=").append(r.getSkuId()).append(", 次数=").append(r.getClickCount()).append("\n");
+        }
+        out.collect(sb.toString());
+
+        // 7. 打扫战场：当前窗口已经结算完毕，把内存状态清空，防止 OOM
+        skuSizeState.clear();
+    }
+}

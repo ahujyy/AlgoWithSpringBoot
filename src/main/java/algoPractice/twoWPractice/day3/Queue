@@ -1,0 +1,64 @@
+####  PriorityQueue  维护一个数组最小堆，  可以用来处理topN， 比如求 热点 top10，  这个 10 个元素在最小堆里，就是最大的10 个数，新来的比[0]还大，就把 [0]换掉，然后下沉找位置
+
+### PriorityBlockingQueue 约等于 PriorityQueue + ReentrantLock ,它们底层都使用 二叉堆（Binary Heap）（也就是用一个数组来表示完全二叉树）来实现优先级排序，入队和出队的时间复杂度都是 O(log N)
+### PriorityBlockingQueue 扩容数组的时候，一个线程抢到扩容任务后(CAS 抢变量锁)，把数组准备好，才会去抢全局锁（ReentrantLock），然后切换数组。
+### BlockingQueue 的一员 （blocking 就是阻塞），PriorityBlockingQueue 必须支持阻塞等待（即 take() 方法：如果队列空了，调用线程必须挂起，直到有新数据进来） 这和PriorityQueue 不会阻塞返回空不一样
+/**
+private final ReentrantLock lock = new ReentrantLock();
+private final Condition notEmpty = lock.newCondition(); // 核心：空队列的等待队列
+当线程调用 take() 发现队列为空时，它会调用 notEmpty.await()，把自己挂起并放入这个条件队列里。
+
+当有新元素通过 put() 或 offer() 进来时，会调用 notEmpty.signal()，把挂起的消费者线程唤醒。
+
+*/
+
+### PriorityQueue 和 PriorityBlockingQueue 队列内容排序的时候，可以用事先构造队列的时候就定义的Comparator 来排序。 复杂逻辑在 compareTo 方法里去实现。
+
+### 其他常见 blockingQueue
+ArrayBlockingQueue：基于数组的有界阻塞队列，必须指定大小，一把锁。
+
+LinkedBlockingQueue：基于链表的阻塞队列（可有界可无界），使用了两把锁（takeLock 和 putLock），实现了读写分离，性能明显优于 ArrayBlockingQueue。
+
+SynchronousQueue：不存储元素的队列。每个 put 必须等待一个 take，反之亦然。常用于线程池（如 CachedThreadPool）做任务传导。
+
+DelayQueue：无界阻塞队列，只有当元素的延迟时间到了才能从队列里取出来（常用于定时任务、订单超时取消）。
+
+
+#### 盘点：非阻塞队列（Non-Blocking Queue）有哪些？
+在 Java 中，非阻塞队列（调用 poll() 或 offer() 时立刻返回，绝不挂起线程）主要分为两大阵营：单线程普通队列和多线程无锁并发队列。
+
+1. 线程安全 的并发非阻塞队列（依靠 CAS 实现）
+这类队列是高并发、高吞吐场景的利器，它们的底层普遍采用无锁（Lock-Free）的 CAS 自旋操作。
+
+ConcurrentLinkedQueue：基于无锁链表实现的 FIFO 队列。它是非阻塞并发队列的绝对主力，适合“多生产多消费”的高频消息传递。
+
+ConcurrentLinkedDeque：它是上面这位的“双端队列（Deque）”版本。支持从队头/队尾双向进出（push/pop/offer/poll），同样是完全无锁的 CAS 实现。适合像 ForkJoinPool 线程池那样的“工作窃取（Work Stealing）”算法。
+
+2. 线程不安全 的普通非阻塞队列（单线程使用，或配合手动加锁）
+这些数据结构本身没有任何锁或 CAS 保护，多线程并发访问直接会导致数据错乱（Fast-Fail 或死循环）。
+
+ArrayDeque：基于循环数组实现的双端队列。在单线程环境下，如果需要实现栈（Stack）或 FIFO 队列，官方强烈推荐用它替代 Stack 和 LinkedList，因为它的数组寻址极快，且没有链表指针的额外内存开销。
+
+PriorityQueue：我们刚聊过的标准二叉堆。没有锁，单线程排序用。
+
+LinkedList：老牌链表，它不仅实现了 List，还实现了 Deque 接口，可以当队列用，但由于每个节点都是独立对象，GC 压力大，现在很少推荐单纯作为队列使用。
+
+### 选型
+总结：架构师的选型心法
+什么时候选非阻塞（ConcurrentNonBlocking）？
+当你的业务是纯内存高频数据交换，且生产和消费的速度基本匹配，或者你打算在应用层自己通过类似 Disruptor 的策略去处理等待（比如用 CAS 自旋或 Thread.yield() 代替挂起），追求极致的几纳秒时效。
+
+什么时候选阻塞（Blocking）？
+当涉及到跨越系统边界、硬件限制（如磁盘、网络、数据库读写能力有限），需要借助队列来做流量削峰、限流、线程池任务分配、或者打通业务语义（如延时、优先级调度）的时候。阻塞是保证计算机资源不被无缘无故白白消耗的最有效手段。
+
+
+
+###场景题
+#### 场景：打包推荐系统中需要处理生鲜和非生鲜混合打包。假设自动化仓库中有一条履约流水线，订单包裹先进先出（Queue）。
+#### 但是突发高优先级的“奢侈品专属打包订单”。如何实现一个支持优先级（PriorityQueue）的无锁/低锁并发队列，防止常规订单被饿死？ 
+#### 这里常规订单被饿死的意思是，如果 luxury 订单优先级高且一直要处理，导致常规订单得不到处理而超时。
+
+
+
+
+PriorityQueue --> 无锁队列 ---> 双有界队列+SLA调度 ------> Kafka Topic隔离+业务/持久化降级

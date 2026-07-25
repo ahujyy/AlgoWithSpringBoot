@@ -1,0 +1,361 @@
+##在风控系统（FDS 2.0）中，需要统计“过去 1 分钟内，同一个用户对同一个 SKU 的点击次数”。请在内存中实现一个滑动窗口计数器。如果瞬时 QPS 达到 10万，你怎么保证它的高并发安全与内存控制？ 这个场景题怎么做？
+
+### 知识点
+####
+1，与 LongAdder、AtomicLong 的核心对比
+特性	AtomicLong	LongAdder	LongAccumulator
+操作类型	精确原子更新 (CAS, getAndSet 等)	仅加/减	任意可结合可交换的二元运算
+高并发写性能	差（热点争用）	极高	极高（同 LongAdder）
+读性能	极快（直接读 volatile 值）	较慢（需合并 Cell）	较慢（需合并 Cell）
+一致性	强一致性（每次操作都可见）	最终一致性（sum 非快照）	最终一致性（get 非快照）
+典型场景	ID 生成器、状态标志、并发控制	QPS 计数、访问量	全局最大值/最小值（math.min max 函数）、自定义统计量
+LongAdder 其实是 LongAccumulator 的一个语法糖：
+
+java
+LongAdder adder = new LongAdder();
+// 等价于
+LongAccumulator adder = new LongAccumulator((x, y) -> x + y, 0);
+
+2， flink state变量都一个 key，用来全局获取。 算子里定义 state 变量 表示次变量是受 flink 托管的， 可能存在 rockDB 或者纯内存中 ， rockDB 会有序列化操作。
+
+3，Caffeine 号称“Java 缓存之王”， 本地内存，不像 redis ，不用序列化
+
+
+#### 
+1，RPC 微服版本(Java 环形数组 + 本地内存)， 核心优势是可以实时拦截，几个 ms 之内。有两个小版本。 核心都是60 个 buckets 代表一分钟内每一秒的统计，秒数不等代表是至少上一分钟前的数据，计数要归零。
+    1.1 用 CurrentHashMap 分散竞争粒度。后面用 时间轮（HashedWheelTimer） 注册删除超 1/2 分钟不活跃 key （userID+productID）， 防止 OMM
+    1.2 用 Caffeine 来代替 CurrentHashMap， 可以设置 ttl，让不活跃的 key 删除， 防止 OOM
+
+// 在 Spring Boot Controller 或 RPC 实现类中
+@RestController
+public class AntiFraudController {
+    // 注入上一轮我们写的无锁高性能并发滑动窗口工具
+    @Autowired
+    private AntiFraudSlidingWindow slidingWindow; 
+
+    @PostMapping("/checkClick")
+    public Response check(@RequestBody ClickRequest req) {
+        // 多线程并发环境下直接调用
+        // 内部依靠 LongAdder 的 Cell 数组分流，对抗同一个黄牛账号的并发暴刷
+        long totalClicks = slidingWindow.clickAndGetCount(req.getUserId(), req.getSkuId());
+        
+        if (totalClicks > 100) {
+            return Response.reject("涉嫌刷单，已被风控拦截");
+        }
+        return Response.success();
+    }
+}
+
+##### ConcurrentHashMap版
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+
+public class AntiFraudSlidingWindow {
+
+    // 1分钟切分成60个格子，每个格子代表1秒
+    private static final int WINDOW_SIZE_SECONDS = 60;
+
+    // 核心复合 Key：UserId + "_" + SkuId
+    // 采用 ConcurrentHashMap 承载高并发
+    private final ConcurrentHashMap<String, WindowBucket[]> monitorMap = new ConcurrentHashMap<>(131072);
+
+    /**
+     * 格子实体：使用 LongAdder 彻底消灭锁竞争
+     */
+    private static class WindowBucket {
+        final long volatile timestampSeconds; // 记录这个格子当前代表的具体秒数
+        final LongAdder counter;
+
+        WindowBucket(long timestampSeconds) {
+            this.timestampSeconds = timestampSeconds;
+            this.counter = new LongAdder();
+            this.counter.add(0);
+        }
+    }
+
+    /**
+     * 核心写入与防刷校验接口
+     * @return 过去 1 分钟内的总点击次数
+     */
+    public long clickAndGetCount(String userId, String skuId) {
+        String key = userId + "_" + skuId;
+        long currentSeconds = System.currentTimeMillis() / 1000;
+        int index = (int) (currentSeconds % WINDOW_SIZE_SECONDS);
+
+        // 1. 获取或初始化该用户该 SKU 的 60秒 环形数组
+        WindowBucket[] buckets = monitorMap.computeIfAbsent(key, k -> {
+            WindowBucket[] arr = new WindowBucket[WINDOW_SIZE_SECONDS];
+            for (int i = 0; i < WINDOW_SIZE_SECONDS; i++) {
+                arr[i] = new WindowBucket(0); // 初始秒数为 0
+            }
+            return arr;
+        });
+
+        WindowBucket bucket = buckets[index];
+
+        // 2. 检查当前格子的时间戳，实现“无锁平滑滚动重置”
+        if (bucket.timestampSeconds != currentSeconds) {
+            // 说明这个格子是 1 分钟前留下的老格子，需要清空重置为当前秒
+            synchronized (bucket) { 
+                // 极小粒度的锁，只有在每秒跨度的那一头一尾发生微弱竞争
+                if (bucket.timestampSeconds != currentSeconds) {
+                    bucket.counter.reset(); // 清空历史数字
+                    // 必须最后修改时间戳（ volatile 语义保障可见性 ），防止其他线程在重置完前写入
+                    // 注：此处若追求极致性能，可将 timestampSeconds 设为 volatile 并在外面配合 CAS
+                    // 本处使用简易轻量级 synchronized 锁住单个格子，在高分流下竞争极小
+                    bucket.timestampSeconds = currentSeconds; 
+                }
+            }
+        }
+
+        // 3. 增量累加当前这一秒的点击数 (O(1) 无锁)
+        bucket.counter.increment();
+
+        // 4. 顺着环形数组，累加过去 60 秒内所有未过期的有效格子
+        long totalClicks = 0;
+        for (WindowBucket b : buckets) {
+            // 只有时间戳在当前 1 分钟内的格子才算数
+            if (currentSeconds - b.timestampSeconds < WINDOW_SIZE_SECONDS) {
+                totalClicks += b.counter.sum();
+            }
+        }
+
+        return totalClicks;
+    }
+}
+
+##### Coffein版
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
+
+public class AntiFraudCaffeineFDS {
+
+    // 60个格子代表60秒
+    private static final int WINDOW_SIZE = 60;
+
+    /**
+     * 每一个格子（槽位）的实体
+     */
+    private static class DiskBucket {
+        // 必须置 volatile，保证跨线程的“过期判定”可见性
+        volatile long timestampSeconds; 
+        final LongAdder counter;
+
+        DiskBucket(long timestampSeconds) {
+            this.timestampSeconds = timestampSeconds;
+            this.counter = new LongAdder();
+        }
+    }
+
+    /**
+     * 每个用户+SKU 拥有的独立窗口对象
+     */
+    public static class UserSkuWindow {
+        // 初始化 60 个格子，对象仅创建一次，后续全量复用
+        final DiskBucket[] buckets = new DiskBucket[WINDOW_SIZE];
+
+        UserSkuWindow() {
+            for (int i = 0; i < WINDOW_SIZE; i++) {
+                buckets[i] = new DiskBucket(0); // 初始秒数为 0
+            }
+        }
+    }
+
+    // 利用 Caffeine 自带的驱逐策略，彻底干掉自定义的 lastActiveTimestamp 和外部 TimeService
+    private final Cache<String, UserSkuWindow> monitorCache = Caffeine.newBuilder()
+            .maximumSize(2000000) // 最大承载 200 万个 Key，防 OOM
+            .expireAfterAccess(5, TimeUnit.MINUTES) // 5分钟无流量自动剔除僵尸 Key
+            .build();
+
+    /**
+     * 风控判定核心接口（完美承载 10万 QPS，仅对槽位精准加锁）
+     */
+    public boolean clickAndCheck(String userId, String skuId) {
+        String cacheKey = userId + "_" + skuId;
+        long currentSeconds = System.currentTimeMillis() / 1000;
+        int index = (int) (currentSeconds % WINDOW_SIZE);
+
+        // 1. 从 Caffeine 获取或创建窗口（纯指针引用，0 序列化）
+        UserSkuWindow window = monitorCache.get(cacheKey, k -> new UserSkuWindow());
+        DiskBucket bucket = window.buckets[index];
+
+        // 2. 检查当前格子是否已经是“一分钟前甚至更早”的历史脏数据
+        if (bucket.timestampSeconds != currentSeconds) {
+            // 细粒度锁：只锁这 1 个槽位，不影响其他 59 个槽位的并发写入与统计
+            synchronized (bucket) {
+                if (bucket.timestampSeconds != currentSeconds) {
+                    bucket.counter.reset(); // 过去的值置 0
+                    bucket.timestampSeconds = currentSeconds; // 修正为当前秒数
+                }
+            }
+        }
+
+        // 3. 完美的无锁并发累加（LongAdder 内部通过 Cell 数组分流，消灭 CPU 缓存行伪共享）
+        bucket.counter.increment();
+
+        // 4. 统计过去 1 分钟（60秒内）所有未过期的有效格子总和
+        long totalClicks = 0;
+        for (DiskBucket b : window.buckets) {
+            // 只有那些没有过期的格子才参与求和（如果某个格子断流了，它的秒数太老，这里直接略过，相当于惰性剔除）
+            if (currentSeconds - b.timestampSeconds < WINDOW_SIZE) {
+                totalClicks += b.counter.sum();
+            }
+        }
+
+        // 5. 规则判定：1 分钟内点击不能超过 100 次
+        return totalClicks <= 100;
+    }
+}
+
+
+2，Flink 版，绝对不要用 flink 的 timewindow ，太笨重，都受 flink 管理，默认是 rockDB，会撑爆。  还是利用环形数组来解决时间窗口。把计数放到 state 里去受 flink 管理，这样 checkpoint 可以
+    使得程序更加健壮，keyby 操作让特定的用户和 product 在同一个实例，流式又使得计数没有竞争。缺点是延迟大于 RPC 版本，不能实时。
+
+
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+// 1. 设置状态后端为 HashMapBackend
+env.setStateBackend(new HashMapStateBackend());
+// 2. 必须要配置 Checkpoint 持久化存储路径（比如 HDFS 或 OSS）
+// 虽然它叫内存后端，但它的 Checkpoint 副本必须找个地方存下来，
+// 否则节点挂了还是没法恢复。
+env.getCheckpointConfig().setCheckpointStorage("hdfs://namenode:4001/flink-checkpoints");
+// 3. 开启增量或者周期性 Checkpoint
+env.enableCheckpointing(60000); // 每 1 分钟做一次快照
+
+
+StateTtlConfig ttlConfig = StateTtlConfig
+    .newBuilder(org.apache.flink.api.common.time.Time.minutes(5)) // 5分钟没访问就自动蒸发
+    .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)   // 每次写入/修改时刷新生存时间
+    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+    .cleanupInRocksdbCompactFilter() // 如果以后切到 RocksDB 也有用
+    .build();
+
+ValueStateDescriptor<long[]> desc = new ValueStateDescriptor<>("window-bucket", long[].class);
+desc.enableTimeToLive(ttlConfig); // 注入 TTL 配置
+windowState = getRuntimeContext().getState(desc);
+
+import org.apache.flink.api.common.functions.RichFlatMapFunction;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.util.Collector;
+import java.util.Arrays;
+
+public class FlinkPureMemoryWindowFunction extends RichFlatMapFunction<ClickEvent, AlertResult> {
+
+    // 托管状态：保存 60 个秒格子的数组
+    private transient ValueState<long[]> windowState;
+    // 托管状态：记录这个 Key 上一次发生点击时的具体秒数
+    private transient ValueState<Long> lastUpdateState;
+
+    @Override
+    public void open(Configuration parameters) {
+        windowState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("window-bucket", long[].class)
+        );
+        lastUpdateState = getRuntimeContext().getState(
+            new ValueStateDescriptor<>("last-sec", Long.class)
+        );
+    }
+
+    @Override
+    public void flatMap(ClickEvent event, Collector<AlertResult> out) throws Exception {
+        long currentSeconds = event.getTimestamp() / 1000;
+        int index = (int) (currentSeconds % 60);
+
+        // 1. 获取堆内存中的数组引用 (HashMapBackend 下为 O(1) 纯指针获取)
+        long[] buckets = windowState.value();
+        Long lastSec = lastUpdateState.value();
+
+        if (buckets == null) {
+            buckets = new long[60];
+            lastSec = currentSeconds;
+        }
+
+        // 2. 核心算法：惰性跨度擦除（解决没有流量撞击时，老格子的数据残余问题）
+        long gap = currentSeconds - lastSec;
+        if (gap > 0) {
+            if (gap >= 60) {
+                // 如果距离上次点击已经过去超过1分钟，说明全部格子都过期了，直接全部重置为 0
+                Arrays.fill(buckets, 0);
+            } else {
+                // 如果只过去了若干秒，顺着环形缓冲区，把过去这段空白期对应的格子抹平
+                for (long i = lastSec + 1; i <= currentSeconds; i++) {
+                    buckets[(int) (i % 60)] = 0;
+                }
+            }
+            lastSec = currentSeconds;
+            lastUpdateState.update(lastSec);
+        }
+
+        // 3. 原地修改！(No Object Creation, No Array Copy)
+        buckets[index]++; 
+
+        // 4. 求和过去 1 分钟内的总数
+        long totalClicks = 0;
+        for (long count : buckets) {
+            totalClicks += count;
+        }
+
+        // 5. 状态写回（在 HashMap 后端中仅是引用覆盖，极快）
+        windowState.update(buckets);
+
+        // 6. 阈值判定
+        if (totalClicks > 100) {
+            out.collect(new AlertResult(event.getUserId(), event.getSkuId(), totalClicks));
+        }
+    }
+}
+
+
+
+1. 10万 QPS 下，你怎么保证“高并发安全”和“极致吞吐”？
+分流锁粒度（ConcurrentHashMap）：
+10万 QPS 听起来吓人，但由于它是“同一个用户 + 同一个 SKU”，在实际风控中，流量被数万个不同的 Key 彻底摊平。
+ConcurrentHashMap 底层使用 CAS 和红黑树的分段无锁化设计，在 Key 足够分散的情况下，几乎没有锁冲突。
+
+消灭锁竞争（LongAdder 阻击伪共享）：
+传统的原子类 AtomicLong 底层是 CAS 死循环。当 10万 QPS 撞向同一个热点商品时，多个 CPU 内核会疯狂修改同一个变量，导致 CPU 的 L1/L2 缓存行频繁失效（Cache Line Flashing）。
+我在这里使用的是 LongAdder。它在底层维护了一个 Cell[] 数组。当高并发涌入时，不同的线程会被路由到不同的 Cell 里独立累加，最后求 sum()。
+这直接把 CPU 的热点竞争转为了多 Cell 的内存分流，达到了真正的 $O(1)$ 无锁吞吐。
+
+单槽轻量锁（Lazy-Reset）：
+当时间跨入新的一秒时，旧格子的清空仅锁住当前这 1 个 Slot（槽位），而不是锁住整条用户数据，且一秒只会触发一次 reset()，后续 10万流量依然是无锁的 increment() 进场。
+
+
+
+###### flink 按变化输出结果，没有变化不输出。 风控输出变量供机器学习和规则引擎用，变化触发规则引擎过规则，不要按时间窗口步长输出，用 changlog，
+ ######f 状态是永久驻留内存、永不销毁的，得处理过期的不活跃的状态
+-- 1. Flink SQL 自动维护 1 小时滑动窗口（1秒滑一次）
+SELECT 
+    pcid,
+    COUNT(order_id) AS order_cnt
+FROM 
+    order_table
+GROUP BY 
+    pcid, 
+    HOP(row_time, INTERVAL '1' SECOND, INTERVAL '1' HOUR);
+
+// 核心救命代码：设置状态的过期时间
+// 如果一个 Key 在 1.5 小时内没有任何新数据进来，直接把它从内存里彻底抹去！
+tableEnv.getConfig().setIdleStateRetention(Duration.ofMinutes(90));
+
+    // 现在的写法：显式转成 Changelog 流
+DataStream<Row> changelogStream = tableEnv.toChangelogStream(table);
+
+changelogStream.process(new KeyedProcessFunction<String, Row, Void>() {
+    @Override
+    public void processElement(Row row, Context ctx, Collector<Void> out) {
+        // 这就是 Flink SQL 自动帮你吐出的变更标签！
+        RowKind kind = row.getKind(); 
+        
+        if (kind == RowKind.INSERT || kind == RowKind.UPDATE_AFTER) {
+            // 说明变量值变大了，或者更新了，赶紧过一遍风控规则阻断
+        } else if (kind == RowKind.UPDATE_BEFORE || kind == RowKind.DELETE) {
+            // 说明老数据滑出窗口了，变量值变小了，赶紧过一遍风控规则看能不能解封
+        }
+    }
+});
+

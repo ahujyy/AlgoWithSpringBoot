@@ -1,0 +1,44 @@
+## 中心化个人信息脱敏系统。海量 API 调用中的姓名、地址、电话全部需要 Token 化。如何设计一个高效的网关级过滤器（Filter），
+## 通过高效的字符串匹配（如 Aho-Corasick 算法或 Trie 树）在不显著增加延迟的情况下自动识别并拦截未脱敏的 PI 信息
+
+#Aho-Corasick AC 自动机 Trie tree 
+
+### 1, token 不是加密，它可以是无意义乱码，vault 会对应明文，它数学上完全不可逆，安全。 如果要求不方便查库的边缘场景，需要加密，然后可以解密。
+### 2， Gateway Filter 可以 对入口，出口都进行过滤， AC 里注册了关键字段名称，过 json 串的时候，会找到所有 PI 字段名称对应的位置，
+###     然后得到 value 后可以用正则表达式来判断是否是token ，不是要替换。
+### 3，对业务层面需要强一致token 的 domains 可以用一致 token， 而大数据分析平台或者其他部门可以用自己的局域的 token。
+### 4， tokenize 可以放在 gateway 上 （统一，各业务部门不用单独实现，网关压力大）， 也可以用不同的语言实现的 sdk 放在业务端分担压力（更新难管理）。 
+###     最好用service mesh 的 sidecar 来专门做（例如Envoy），像做日志管理或者监控管理一样放在 sidercar 不影响主 pod。
+### 5， AC状态机里面 失配指针（Failure Link）非常重要，匹配到节点没有路了，会跳到别的节点，不用重新回到根节点。 这样匹配字符串只用一遍就能发现所有匹配内容的多位置。
+
+###  AC 自动机（Aho-Corasick）本质上就是“站在树上的 KMP 算法”，或者说是“多模式串的 KMP”。它们共享了完全相同的核心哲学——“最长公共前后缀”。
+#### 不管是 KMP 还是 AC，它们要解决的终极问题都是：当我在文本中匹配到一半突然失败（失配）时，我能不能不回退文本指针，而是利用已经匹配好的那部分信息，
+#### 直接跳到下一个可能匹配的位置？为了做到这一点，它们都盯上了同一个数学概念：最长公共前后缀。
+
+import org.ahocorasick.trie.Trie;
+import org.ahocorasick.trie.Emit;
+import java.util.Collection;
+
+public class ACDemo {
+    public static void main(String[] args) {
+        // 1. 构建包含 4 个敏感词的自动机
+        Trie trie = Trie.builder()
+                .addKeyword("he")
+                .addKeyword("she")
+                .addKeyword("his")
+                .addKeyword("her")
+                .build();
+
+        // 2. 输入你的测试文本
+        String text = "ushers";
+        Collection<Emit> emits = trie.parseText(text);
+
+        // 3. 打印结果
+        for (Emit emit : emits) {
+            System.out.println("匹配到词: " + emit.getKeyword() + "，范围: [" + emit.getStart() + "," + emit.getEnd() + "]");
+        }
+    }
+}
+
+
+

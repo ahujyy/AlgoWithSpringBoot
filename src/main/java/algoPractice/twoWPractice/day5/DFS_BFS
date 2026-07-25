@@ -1,0 +1,90 @@
+### 场景：风控中需要构建用户风控画像与关联服务（如 Neo4j 关联）。假设要排查“团伙作案”，从一个黑产手机号出发，如何设计一个深度优先（DFS）算法，
+#### 找出与其关联在 3 层以内的所有疑似异常账号？   
+
+
+## 第一印象： 这个题目中关联不是二叉树，是多分叉，可能还有环，也能用 DFS 吗？
+##  多分叉关联用数组表示， 环用去重的 set 来截断，深度用来限制太多层。
+
+import java.util.*;
+
+public class AntiFraudGraphDFS {
+
+    // 模拟底层的风控关系网络服务（如封装了 Neo4j / Redis 缓存的查询）
+    interface GraphService {
+        List<String> getRelatedAccounts(String accountId);
+    }
+
+    private final GraphService graphService;
+
+    public AntiFraudGraphDFS(GraphService graphService) {
+        this.graphService = graphService;
+    }
+
+    /**
+     * 主调用入口：寻找 3 层以内的关联异常账号
+     * @param blackPhone 起始黑产手机号（或初始污染节点）
+     * @return 关联的所有嫌疑账号集合
+     */
+    public Set<String> findFraudGang(String blackPhone) {
+        Set<String> suspectGang = new HashSet<>();
+        if (blackPhone == null || blackPhone.isEmpty()) {
+            return suspectGang;
+        }
+
+        // 执行 DFS，初始深度为 0
+        dfsSearch(blackPhone, 0, suspectGang);
+        
+        // 移除起始节点自身（如果风控业务不希望把最初的黑手机号算进关联嫌疑结果里）
+        suspectGang.remove(blackPhone); 
+        return suspectGang;
+    }
+
+    /**
+     * DFS 核心递归函数
+     */
+    private void dfsSearch(String currentId, int depth, Set<String> suspectGang) {
+        // 核心剪枝 1：如果已经加入集合（代表已被访问过，防环路死循环），直接返回
+        if (suspectGang.contains(currentId)) {
+            return;
+        }
+
+        // 将当前节点标记为已访问并纳入团伙集合
+        suspectGang.add(currentId);
+
+        // 核心剪枝 2：控制步长。如果当前节点刚好是第 3 层，它已经是边界，不能再往下挖第 4 层了
+        if (depth == 3) {
+            return;
+        }
+
+        // 多分叉遍历：从底层图存储中拉取当前节点的邻居（例如：通过该手机号注册的账号、同设备登录的账号）
+        List<String> neighbors = graphService.getRelatedAccounts(currentId);
+        if (neighbors == null || neighbors.isEmpty()) {
+            return;
+        }
+
+        for (String neighbor : neighbors) {
+            // 向下递归，深度加 1
+            dfsSearch(neighbor, depth + 1, suspectGang);
+        }
+    }
+}
+
+
+##追问一：这个场景下，用 BFS 是不是比 DFS 更好？
+你的降维打击回答：
+是的。在限定层数（如 3 层以内）的图遍历中，BFS（广度优先搜索）通常是首选。
+
+
+
+### 原因 2（天然对齐层级）： BFS 是一层一层往外扩的。当执行完第 3 层的 queue.size() 循环后，可以直接优雅地关门收工，
+#### 不需要像 DFS 那样在每条链路的末端反复判断 depth == 3。
+
+##BFS 能够让我们在第一层（最近的距离）就尽早发现风险并拦截（Early Bug Catching）
+####，并且在配合“只拉取前 500 个邻居”这种截断策略时，BFS 的队列结构比 DFS 的递归栈更容易实施和控制。
+
+
+#### 解决热点/“超级节点”的方法：
+#### “在离线上游做清洗，在线上游做拦截，在查询底层做熔断”
+
+
+
