@@ -1,0 +1,40 @@
+### 工程场景题：场景：SKU 迁移时，你用了“数据双写+开关控制到表层面”。  怎么保证双写时，写入 MySQL 和 Cassandra 的最终一致性？ 
+###  迁移完后，如果让你写一个离线数据对账脚本（基于 Spring Batch 思想），面对多亿级的数据，如何高效查出两边数据的不一致？
+
+###最终一致性 
+（3阶段切流）1,应用层双写（MySQL 主，Cassandra 备） 2,读切流（Cassandra 主，MySQL 备） 3,废弃 MySQL（单写 Cassandra）
+
+1,“并发乱序覆盖”问题：利用 Cassandra 的 Native 机制:
+ USING TIMESTAMP 机制：应用层在向 Cassandra 写入数据时，显式带上当前业务的微秒级时间戳（例如 updated_at)
+
+2,解决“单边写入失败/网络抖动”问题：事务消息 / MQ 补偿
+
+3.核心步骤：
+如果 MySQL 的主键是自增的，或者按 SKU_ID 做了聚簇索引：
+
+分片逻辑（Partitioner）：
+
+查出 MySQL 中的 MIN(id) 和 MAX(id)。
+
+将范围按物理 ID 连续切块。例如：
+
+Thread 1: ID [1 ~ 1,000,000]
+
+Thread 2: ID [1,000,001 ~ 2,000,000]
+
+与 Streaming 的结合：
+
+在每个 Thread 内，执行 SELECT * FROM sku WHERE id >= min AND id < max。
+
+此时数据是严格连续的！ 可以完美开启 JDBC 的 Streaming（ResultSet.TYPE_FORWARD_ONLY + FetchSize(Integer.MIN_VALUE)），MySQL 顺着 B+ Tree 顺序读，性能极高。
+
+Cassandra 端配合：
+
+把从 MySQL 这一批流式读出来的 1000 个连续 SKU_ID，拼成一个 List，直接去 Cassandra 执行 SELECT ... WHERE id IN (...) 批量读取，或者利用 CQL 的 Async 异步批量并行查询
+
+：对每一个 Chunk 的数据（如 1000 条 SKU 的核心字段拼成字符串），分别在 MySQL 和 Cassandra 端计算 MD5 / SHA-256 哈希值。
+
+
+
+考点：Metric 和数量一致 $\neq$ 数据内容一致：Metric 只能证明“写入调用次数”或“总行数”相同，无法识别“写成功了但字段被截断/更新顺序颠倒（并发覆盖）”或“静默数据损坏”的问题。缺乏“强一致/最终一致”的机制控制：面试官问“怎么保证最终一致性”，是在考察异步重试、补偿机制、并发控制（版本号/时间戳）和分布式事务/最终一致性模式，
+

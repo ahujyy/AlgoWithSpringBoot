@@ -63,3 +63,12 @@ public class SingleFlight {
 caffeine 设置一个最大容量，比如 maximumSize(10000)（内存里只准存 1 万个 SKU）。它通过底层极其强悍的 W-TinyLFU 算法，自己进行“高频无意识筛选”。
 Count-Min Sketch（四级草图计数器） 是独立计数访问次数，ttl 过期了数据不在了， 但是计数还在，重新加载后访问权重还是在的，不用担心重新计算再平衡。
 虽然保留了 count 次数，但是如果数据真的冷下来，它会不定期暴力除一个数，多次以后就降下来了。持续热门的会被新流量增加回去。 
+
+
+缓存穿透是热点key 在缓存中miss了，只能查db。 就用SingleFlight限制同一个key 同时查db， 同一个key 只允许一个查， 其他线程等这个further get 结果。 
+这样即使有很多QPS， 分成不同的key只一个qps后，整体量就下来了。 
+缓存雪崩是redis 崩了，或者大批量key同时失效了（ttl时间 base+随机性值，不会同时失效），这样所有流量都查db。
+
+caffeine 作用是快， 没有序列化本地jvm访问， 能抵挡50万qps，支持大量qps， 还有就是防止redis 挂了造成的雪崩，redis 需要有备份standby node（主从）。
+
+ConcurrentHashMap 的 putIfAbsent 天然有合并过个同时请求的key的作用。

@@ -1,0 +1,274 @@
+Kubernetes 集群几大组件： （control plane 控制平面包含的组件： etcd，kube-apiserver，kube-scheduler ， kube-controller-manager[Node Controller、Deployment Controller], cloud-controller-manager）
+kube-apiserver  cli 命令入口
+kube-controller-manager   管理集群如：健康状态，自动扩展，滚动更新
+kube-scheduler  决定把 pod 放到那个 node
+etcd  集群数据库
+
+kube-proxy node 的流量管理，端口映射等，当前节点的 kube-proxy监视 apiserver一旦发现 etcd 里新增或修改了 Service/Endpoints 记录，就立即将其“翻译”成当前节点内核中的 iptables/IPVS 规则。
+pause   pod 的基础容器，pause 函数得名，给 pod 占一个IP, pod 重启需要。
+kuberlet  pod 的运维  volumn cni 管理
+网络插件 flannel/Calico 
+
+其他组件： 
+kube-dsn  为集群提供 DNS 服务，
+ingress controller 为 service 提供外网入口
+heapster  资源监控
+
+一台机器可以同时是 master node 也可以同时是 worker node。  master node 有kube-apiserver， kube-controller-manager ， kube-scheduler。
+worker node 有kuberlet ，kube-proxy ，网络插件等。 
+node 上安装的时候可以是二进制安装（下载安装包）， 也可以是在 master 上安装 containerd/docker 和 kubeadm kubelet kubect后， 借助kubeadm来安装对应的以 pod 形式出现的组件（云原生），然后对应 更多的 master nodes 加入进来， worker node 加入集群。
+master 高可用常用的方式有： HAProxy + keepalived ， kube-vip 。  比如用三个 node 做 master， etcd 也安装在这三个 node 上，etcd 的 leader 负责写。 
+master 也同时安装在三个 node 上，master 本身没有 leader 角色的， 三个 master 的 apiserver 都可以同时服务， 写入冲突控制在 etcd 层面。 但是因为
+kube-controller-manager 和 kube-scheduler 是有状态的管理，所以会只有一个实例在实际做工作。HAProxy + keepalived 里/ kube-vip  核心功能是提供 virtual IP
+作为唯一 master对外服务，这样即使有一个 master node 不工作，对外的 ip 是不变的，不是直接的 master ip。 
+HAProxy + keepalived 里的 HAproxy 还可以分发流量到各个 master， 哪个 HAproxy 负责分发由keepalived 用优先级来选举获得虚拟IP（VIP）绑定到该 node 的 HAproxy。 如果keepalived 探测到HAproxy http 健康请求不工作了，就杀掉自己，这样其他的 node 上keepalived获得虚拟IP（VIP），从而保证 VIP 映射到健康的HAproxy。HAproxy本身也不停的检测 apiserver 健康 node。
+kube-vip 通过在每个 Master 节点上运行一个静态 Pod（Static Pod)来工作（所以例子中三台都要装）,通过 Kubernetes 的 Lease（租约）资源 或 Raft 协议 进行选举，选出一个 Leader,leader
+绑定 VIP，域名绑定到 VIP，BGP（ECMP）模式 不会只选一个 Leader，多个 master的 api-server 都可以获得流量.
+kube-vip 存在的意义是为 kube-apiserver 提供统一的 IP 访问入口。如果 kube-vip 是普通 Pod，它必须依赖 API Server 才能被创建和调度,它是不能依赖API Server的。
+静态 Pod 的 YAML 文件放在本地的 /etc/kubernetes/manifests/ 目录下，kubelet 不需要经过 API Server 就能识别并决定要运行这个 Pod。这叫"绕过 API Server"。
+AWS 上高可用可以让 LB 绑定到 master nodes 前面。 
+
+
+安装步骤：
+操作系统 及配置，  网桥过滤[net.bridge.bridge-nf-call-iptables = 1, 同一个 node 下的 pods通信，它们的虚拟网卡绑在同一个网桥上，网桥需要检测node 根 NetNS下的 iptables/IPVS 做 DAT] 和内核转发[net.ipv4.ip_forward = 1, 允许 Linux 主机像路由器一样转发不属于自己的数据包]，关闭 swap,时间同步等
+容器管理工具：  docker / contianerd/podman/iSulad（华为），  runc 的安装。
+		runc 专注于一件极单一的事：创建 Namespace、配置 cgroup、切换 rootfs 【三个是"启动容器"的全部底层动作】, runc 用 go 编写。
+软件源及容器镜像：k8s 源/阿里源     intall（ kubeadm kubelet kubect ）后， kubeadm config ** 生成集群配置，然后运行 kubeadm init ** 来初始化集群。
+网络插件  flannel Calico
+
+
+
+
+实际上，在 Linux 内核看来，"启动一个容器" == "创建一个有特殊属性的进程"。
+这个"特殊属性"具体就是：
+创建 Namespace：让这个进程拥有独立的 PID(pid表)、Network、Mount 视图。
+配置 cgroup：告诉内核这个进程只能用多少 CPU 和内存。
+切换 rootfs：用 pivot_root 把进程的根目录换成镜像里的文件系统（比如 Alpine 的根目录）。
+做完这三步后，最后一步就是调用 execve() 系统调用去执行业务进程（如 /pause、java -jar app.jar 或 /bin/bash）这三个动作做完，容器就在运行了
+
+
+在 Kubernetes 中的完整工作流（时间线）： API Server ---> kuberlet ---> containerd/docker --->runc
+当你在 K8s 中创建一个 Pod 时，底层发生了这些事情：（pause 容器也是 runc 负责创建的，和业务容器一样流程）
+
+API Server 将 Pod 配置调度给 Node 上的 Kubelet。 
+Kubelet 调用 CRI（Container Runtime Interface） 的 gRPC 接口（通常是 Containerd）。
+Containerd 收到请求，下载镜像，并生成一份 OCI 标准的 config.json（包含环境变量、挂载卷、以及从 YAML 解析出的 cgroup 资源限制）。
+Containerd 调用 runc，并把这份 config.json 传给 runc。
+runc 执行以下关键动作：
+创建新的 Namespace（隔离环境）。
+在 /sys/fs/cgroup/ 下创建该容器的专属子目录（应用 cgroup）。
+启动容器进程（PID），并立即将该 PID 写入刚刚创建的 cgroup 子目录的 tasks 或 cgroup.procs 文件中。
+从此以后，该进程及其所有子进程的 CPU/内存使用，都被 cgroup 牢牢锁在了配额之内。
+
+
+
+kebctl --help 能看到对资源的操作。
+常见的（还有其他）资源类型 Kind: 
+pod    pod 是 k8s 基本单位，但是它不是一个进程， container 才是，pod 可以说是一个container 组。
+service   svc它默认ClusterIP类型， 还可以是NodePort， LoadBalancer。 ClusterIP最常用也就是集群内IP，外部访问不了。
+replicationcontroller（废弃了） 致命缺陷：标签选择器太弱。它只能匹配 key = value 这种“等式”（Equality-based）
+replicaset    支持 matchExpressions，比如 In、NotIn、Exists, 不会直接创建 RS。它退居幕后，只作为 Deployment 的“工具人”
+job
+cronjob
+Ingress
+endpoint   pod 的 ip + 端口 构成 endpoint 
+ConfigMap
+Secret   Secret 只是 base64 编码，解码即可见
+PersistentVolume （PV）
+PersistentVolumeClaim （PVC）
+Namespace
+CustomResourceDefinition (CRD)
+
+
+service：
+svc它默认ClusterIP类型， 还可以是NodePort， LoadBalancer（例子Ingress Controller 本身的 Service ）。 
+ClusterIP最常用也就是集群内IP，外部访问不了（pod ip 也是外部访问不了的，pod ip 和 svc ip 是不同的网段），它的意义是提供一个固定 
+ip（固定的dns名称），给后面的一堆 pods 做方向代理，比如一个具体内部微服务。
+它是通过 Endpoint来实现的，创建了一个 svc-a ,它 有一个 Label Selector（比如 app: nginx），任何 Pod 带有 app: nginx 标签且处于 Running 状态，就会
+加入到 svc-a 同名的 endpoints 对象里去。kube-proxy 直接观察 Endpoints 列表，任何变动都会立即更新所有节点的 iptables/IPVS 规则，把流量转发到新的IP上。
+不在 Service 里写 Label Selector 时，Kubernetes 就不会自动生成 Endpoints，手动创建Endpoint, 配上集群外部数据的 ip就能做成数据 service 供内部使用，
+NodePort它在每一个 Node 的物理网卡（eth0）上都打开了一个端口来映射到 service。
+另外，ClusterIP 还有一个特殊模式叫 ClusterIP: None（无头服务）。这种模式不分配任何虚拟 IP，直接返回 Pod 的真实 IP 列表（用于 StatefulSet 的有状态服务，如数据库）。 
+Pod deployment service 它们只是“期望状态（Desired State）” 的声明。当你执行 kubectl apply -f service.yaml 时，API Server 只是将这个 YAML 文件内容序列化为 JSON，存储到 etcd 中。它只是一段躺在数据库里的文本数据。
+
+
+deployment:
+演进路径与区别（RC -> RS -> Deployment）Deployment 管理 ReplicaSet，ReplicaSet 管理 Podkubectl 
+Deployment自动保留历史 Revision，可以回滚， 它可以滚动更新、蓝绿、金丝雀、回滚。
+
+滚动更新：侧重Pod实例的逐步替换，无法精细控制用户流量。改动同一个deployment， 同一个rs下新的 pod 替换老的 pod
+蓝绿部署：侧重环境的整体切换，是全量的、瞬间的流量切换。
+			---创建两个独立的Deployment（如myapp-blue和myapp-green），并通过修改Service的selector来切换流量
+			--- kubectl patch service myapp-svc -p '{"spec":{"selector":{"app":"myapp","version":"green"}}}'  命令瞬间切换
+金丝雀发布：侧重流量的百分比控制，实现平滑过渡。
+			---1，通过新旧 pod 比例来实现。两个独立Deployment 用同一个service. 
+				  deployment1:
+				  	  selector:
+		   				 matchLabels:
+		      				app: myapp
+		      				version: v1
+		      	   deployment2 用 app: myapp && version: v1，  而 service  的selector是app: myapp ， 这样service 把两个都能选中，
+		      	   而不停的控制deployment2 里 replica 数量，让它增长，同时让deployment1的数量减少， 这样达到比例增长的目的。
+		    ---2， 使用 service mesh 服务网格 （如Istio）Istio 的自定义资源类型 VirtualService 里可以直接配weight ，两个 weight 加起来 100
+		    		原理： 为每个 Pod 注入一个 Envoy sidecar 容器来接管流量，在访问端来的 sidecar 来控制流量走向， sidecar 代理会向 Istio 的控制平面（istiod）查询该目标服务的路由规则（即 VirtualService 和 DestinationRule。 服务端会部署新、旧两个版本的 Deployment，它们各自拥有不同的标签（例如 version: v1 和 version: v2），并指向同一个 Kubernetes Service。Envoy 得到
+		    		这个service 下的 pod 和配置，直接访问 不同版本的 pod 。 Pod A (客户端) -> Pod A 的 Envoy -> （直接连接） -> Pod B (v2 版本) 的 IP:端口
+
+
+rollout（版本发布管理）：
+kubectl rollout status deployment/nginx：查看滚动更新进度。
+kubectl rollout history deployment/nginx：查看历史版本（背后就是历史 RS 记录）。
+kubectl rollout undo deployment/nginx：一键回滚到上一个版本。
+kubectl rollout restart deployment/nginx：重启 Pod（不改变镜像，常用于刷新配置，通过重新创建 Pod 重新挂载 ConfigMap）。
+
+kubectl scale（扩缩容管理）：
+kubectl scale deployment/nginx --replicas=5：直接将副本数调整为 5。  
+		----(这样命令设置和 git yaml 文件配置不一样， etcd 里记录是从 yaml 而来期望配置。所以任何改动都要通过 yaml 文件来实现，体现一致性best practice)
+它与 HPA（Horizontal Pod Autoscaler）结合时，HPA 会自动修改这个副本数。
+
+k8s 中 的存储落盘会随着 pod 消失而消失，所以会有 PV 和 PVC， 然后一些配置可以用对象的形式放在 cm 或者 secret 当中，存入 etcd， 这样就可以被 yaml 配置调用， 它们都是在 volume 中声明的。
+
+数据持久化：Pod 重启后数据不能丢	PV / PVC   一个 PVC 只能绑定一个 PV，一个 PV 只能被一个 PVC 绑定，
+PVC 删除后，PV 的行为由 persistentVolumeReclaimPolicy 决定： Retain ， Delete。
+PVC 创建 ---> 控制平面（PV Controller）查找匹配的 PV ---> 
+  匹配条件：存储容量 >= 需求、AccessModes（RWO/ROX/RWX）吻合、StorageClass 一致 ---> 
+  绑定成功 ---> PVC 状态变为 Bound ---> Pod 可以使用
+如果不提前创建静态 PV，可以配置 StorageClass + PVC 让集群按需自动创建 PV，控制平面会自动调用云厂商 API 创建新硬盘并生成 PV。
+
+
+配置解耦：镜像不变，配置可变（环境变量、证书、配置文件）	ConfigMap / Secret
+
+volumes 支持的数据源类型
+persistentVolumeClaim	持久（独立于 Pod）	数据库、文件存储
+configMap	跟随 Pod（只读）	配置文件、环境变量
+secret	跟随 Pod（只读）	密码、证书
+emptyDir	跟随 Pod（Pod 删除即清空）	临时缓存、共享内存
+hostPath	跟随节点（挂载宿主机目录）	调试、监控（生产慎用）
+nfs / cephfs	持久（外部存储）	共享文件系统
+
+Yaml 样例：
+apiVersion: v1
+kind: Pod
+spec:
+  volumes:                          # 1. 声明可用数据源
+  - name: my-pvc-storage
+    persistentVolumeClaim:
+      claimName: my-pvc             # 引用 PVC（持久化数据）
+  - name: my-config
+    configMap:
+      name: app-config              # 引用 ConfigMap（非敏感配置）
+  - name: my-secret
+    secret:
+      secretName: db-password       # 引用 Secret（敏感配置）
+  - name: empty-dir
+    emptyDir: {}                    # 空目录（生命周期跟随 Pod，重启即丢）
+  containers:
+  - volumeMounts:                   # 2. 声明挂载到容器哪个路径
+    - name: my-pvc-storage
+      mountPath: /data
+    - name: my-config
+      mountPath: /etc/app/config
+    - name: my-secret
+      mountPath: /etc/app/secrets
+      readOnly: true
+    - name: empty-dir
+      mountPath: /tmp/cache
+
+
+
+   -----Ingress--------------集群默认不安装任何 Ingress Controller，手动部署-----------Gateway API：Kubernetes 新一代流量治理标准（比 Ingress 更强大，支持多协议、多网关）------
+
+
+1. 你执行 kubectl apply -f ingress.yaml
+2. API Server 将 Ingress 资源存入 etcd
+3. Ingress Controller 通过 Watch API 监听到新 Ingress
+4. Controller 读取 Ingress 中的 Host/Path/Service 信息
+5. Controller 动态生成 Nginx/Envoy 配置文件（如 nginx.conf）
+6. Controller 将新配置 reload 到网关 Pod（热加载，不中断连接）
+7. 外部请求到达网关时，按最新路由表转发
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app-ingress
+  namespace: default
+  annotations:                      # 关键！不同 Controller 的扩展配置
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx           # 指定使用哪个 Ingress Controller（1.21+ 推荐）
+  tls:                              # HTTPS 配置
+  - hosts:
+    - www.myapp.com
+    secretName: myapp-tls-secret    # 引用 Secret（需提前创建，含 cert 和 key）
+  rules:
+  - host: www.myapp.com             # 域名匹配
+    http:
+      paths:
+      - path: /api                  # 路径匹配（前缀匹配）
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service       # 后端 Service 名称
+            port:
+              number: 8080
+      - path: /web
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80
+  - host: admin.myapp.com           # 另一个域名
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: admin-service
+            port:
+              number: 9000
+
+
+###### Ingress Controller 的 Service ###########
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  type: LoadBalancer           # ← 这是真正让外部能访问的关键
+  ports:
+  - port: 80
+    targetPort: 80
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+
+
+     外部用户 (https://www.myapp.com/api)
+               │
+               ▼
+    ┌─────────────────────┐
+    │ 云厂商 LB / NodePort │   ← Ingress Controller 的 Service（暴露外部）
+    │  (IP: 1.2.3.4:443)   │
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────────────────┐
+    │   Ingress Controller Pod        │   ← 运行 Nginx/Envoy，读取 Ingress 规则
+    │   (根据 Host + Path 查找路由)    │
+    └──────────┬──────────────────────┘
+               │
+    匹配到 host=www.myapp.com, path=/api
+               │
+               ▼
+    ┌─────────────────────┐
+    │  Service: api-service│   ← ClusterIP（仅集群内可访问）
+    │  (10.96.100.50:8080)│
+    └──────────┬──────────┘
+               │
+               ▼
+    ┌─────────────────────┐
+    │   Pod (api-v1-xxx)  │   ← 最终处理请求
+    │   (10.244.2.15)     │
+    └─────────────────────┘ 
