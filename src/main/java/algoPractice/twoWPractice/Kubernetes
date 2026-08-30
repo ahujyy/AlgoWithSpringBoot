@@ -78,6 +78,7 @@ PersistentVolume （PV）
 PersistentVolumeClaim （PVC）
 Namespace
 CustomResourceDefinition (CRD)
+HorizontalPodAutoscaler（HPA）
 
 
 service：
@@ -134,6 +135,32 @@ PVC 创建 ---> 控制平面（PV Controller）查找匹配的 PV --->
   绑定成功 ---> PVC 状态变为 Bound ---> Pod 可以使用
 如果不提前创建静态 PV，可以配置 StorageClass + PVC 让集群按需自动创建 PV，控制平面会自动调用云厂商 API 创建新硬盘并生成 PV。
 
+HPA： 它依赖 Metrics Server 提供的数据。Metrics Server 是一个集群插件。期望副本数 = ceil[当前副本数 * (当前指标值 / 期望指标值)] 当前平均 CPU 使用率是 100m，你的目标是 50m，那么 HPA 会将副本数扩大一倍。
+如果计算出的期望副本数与当前副本数不一致，HPA 会直接更新对应 Deployment 的 replicas 字段， 容忍度 (Tolerance)：默认容忍度为 0.1。只有当 |当前指标值/期望指标值 - 1| > 0.1 时，HPA 才会触发扩缩容。
+# hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  # 指定要扩缩的目标工作负载
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app-deployment
+  # 副本数的范围
+  minReplicas: 1
+  maxReplicas: 10
+  # 扩缩容的指标
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50   # 目标平均 CPU 使用率为 50%
+
+
 
 配置解耦：镜像不变，配置可变（环境变量、证书、配置文件）	ConfigMap / Secret
 
@@ -174,6 +201,12 @@ spec:
       mountPath: /tmp/cache
 
 
+ConfigMap/Secret 挂载为：
+环境变量 (env / envFrom)：在Pod启动时注入，不会自动更新。
+挂载整个目录 (Volume Mount)：会自动更新，但会覆盖目标目录的原有内容。
+挂载单个文件 (subPath)：不会覆盖目录，但也不会自动更新（需 pod 重启）。
+
+Spring Cloud Kubernetes： 这个桥接器能让Spring Cloud 发现 Kubernetes的 svc， 可以将 ConfigMap/Secret 作为 Spring Boot 的配置源，动态跟新配置内容。
 
    -----Ingress--------------集群默认不安装任何 Ingress Controller，手动部署-----------Gateway API：Kubernetes 新一代流量治理标准（比 Ingress 更强大，支持多协议、多网关）------
 
@@ -272,3 +305,224 @@ spec:
     │   Pod (api-v1-xxx)  │   ← 最终处理请求
     │   (10.244.2.15)     │
     └─────────────────────┘ 
+
+
+-------------------------startupProbe livenessProbe readinessProbe -----------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-boot-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-spring-app
+  template:
+    metadata:
+      labels:
+        app: my-spring-app
+    spec:
+      containers:
+      - name: app-container
+        image: myregistry/spring-boot-app:latest
+        ports:
+        - containerPort: 8080
+
+        # -----------------------------------------------
+        # 1. 启动探针（Startup Probe）：保护慢启动
+        # -----------------------------------------------
+        startupProbe:
+          httpGet:
+            path: /actuator/health/readiness   # 建议使用独立的就绪检查端点
+            port: 8080
+          failureThreshold: 30                 # 允许失败 30 次
+          periodSeconds: 10                    # 每 10 秒探测一次
+          timeoutSeconds: 5                    # 超时时间 5 秒
+          # 最大启动等待时间 = 30 * 10 = 300 秒（5分钟）
+
+        # -----------------------------------------------
+        # 2. 存活探针（Liveness Probe）：死锁时重启
+        # -----------------------------------------------
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness    # 仅检查核心状态（非依赖）
+            port: 8080
+          periodSeconds: 10                    # 每 10 秒探测一次
+          timeoutSeconds: 5
+          successThreshold: 1                  # 成功 1 次即视为成功
+          failureThreshold: 3                  # 连续失败 3 次（30秒）后重启容器
+
+        # -----------------------------------------------
+        # 3. 就绪探针（Readiness Probe）：控制流量开关
+        # -----------------------------------------------
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness   # 检查完整依赖（DB、MQ等）
+            port: 8080
+          periodSeconds: 5                     # 每 5 秒探测一次
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3                  # 连续失败 3 次（15秒）后摘除流量
+
+        # -----------------------------------------------
+        # 优雅停机配套配置
+        # -----------------------------------------------
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 5"] # 给应用额外 5 秒处理注销逻辑
+      terminationGracePeriodSeconds: 45        # 总宽限期（必须大于 preStop + Spring 内部超时）
+
+一旦定义了 startupProbe，会暂时禁用 livenessProbe 和 readinessProbe（即使它们已经配置，kubelet 会忽略它们的 initialDelaySeconds）。
+initialDelaySeconds 启动后多久开始探测，startupProbe一般不加，推荐值为 0， livenessProbe 和 readinessProbe 配也无效，被 startup 覆盖。
+startupProbe 成功后， livenessProbe 和  readinessProbe 会立即启动。 
+liveness 的时间一定要远大于 readiness。因为 readiness 可以因为网络抖动频繁摘除流量，但 liveness 过于敏感会导致 Pod 频繁重启，引发滚动更新震荡。
+
+startupProbe 的核心目标是：在应用完成启动前，保护它不被 livenessProbe 误杀。
+Spring Boot Actuator 是 Spring Boot 框架中的一个生产就绪（Production-ready）功能模块。
+它通过暴露一系列 HTTP 端点（Endpoints） 或 JMX（Java 管理扩展） 接口，帮助你监控和管理正在运行的应用
+
+------Ingress NGINX 实现 canary 金丝雀发布（26 年 3 月停止维护）-------------
+主要建两个 Ingress，两者相同的 host 和 path，  Ingress controller 会整合他们变成规则，Canary 里配有百分比。
+外部流量 (myapp.example.com)
+        │
+        ▼
+┌───────────────────┐
+│      AWS ALB      │  ← 只将流量转发到 Nginx Ingress Controller 的 Service
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│ Nginx Ingress     │  ← 唯一的流量入口，读取所有 Ingress 规则
+│ Controller Pod    │
+└─────────┬─────────┘
+          │ 根据 canary-weight: "10" 注解进行流量拆分
+    ┌─────┴─────┐
+    │           │
+    ▼           ▼
+┌───────┐ ┌───────────┐
+│Service│ │ Service   │  ← 两个 Service 名称不同
+│Stable │ │ Canary    │
+└───┬───┘ └─────┬─────┘
+    │           │
+    ▼           ▼
+┌───────┐ ┌───────────┐
+│Pod v1 │ │ Pod v2    │  ← 新旧版本 Pod
+└───────┘ └───────────┘
+
+# 1. 稳定版 Ingress（指向稳定服务 service-stable）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-stable
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: myapp.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: service-stable
+            port:
+              number: 80
+---
+# 2. 金丝雀版 Ingress（指向新服务 service-canary）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"           # 标记为金丝雀
+    nginx.ingress.kubernetes.io/canary-weight: "10"      # 10% 流量进入新版本
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: myapp.example.com       # 注意：Host 必须与稳定版一致！
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: service-canary   # 指向新版本 Service
+            port:
+              number: 80
+这里annotations基于权重的，还有基于 header 的，还有基于 cookie 的。 
+header： nginx.ingress.kubernetes.io/canary-by-header: "foo" ： 值是always 和 never
+nginx.ingress.kubernetes.io/canary-by-header-value: "bar" ，和上面 by-header 配合自定义值
+cookie： nginx.ingress.kubernetes.io/canary-by-cookie: "canary_always"  ， 值是always 和 never
+
+
+======================================== Kubernetes 调度器（Scheduler）========================================
+调度与资源管理：requests vs limits，QoS 等级；nodeSelector、亲和性/反亲和性（nodeAffinity、podAntiAffinity），
+污点与容忍——这在 AI 场景中让 GPU Pod 调度到 GPU 节点至关重要。
+QoS 等级（服务质量）：Kubernetes 根据 Requests 和 Limits 的设定:Guaranteed（有保证,所有容器的 Requests = Limits（且不为 0））>  Burstable（弹性,至少有一个容器设置了 Requests，但不满足 Guaranteed 条件 ）> BestEffort（尽最大努力,没有任何容器设置 Requests 或 Limits)
+##  给node 打上污点： kubectl taint nodes gpu-node-01 gpu=true:NoSchedule  。 只有部署的描述有Tolerations才会被安排到 污点 node（这样就有排他性了）
+## 反亲和性（不要挤在一起）可以现在重要资源不要被多个重任务抢资源，导致都跑不好。
+## 污点效果（Effect）有三种： NoSchedule：不调度到该节点（已有 Pod 不受影响）。PreferNoSchedule：尽量不调度（软策略）。 NoExecute 对已经运行的没有容忍的也会驱逐 常用于节点故障维护
+
+spec:
+  tolerations:                          # 1. 允许进入 GPU 节点
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  affinity:
+    nodeAffinity:                       # 2. 必须落在带 GPU 标签的节点
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: "cloud.google.com/gke-accelerator"
+            operator: "In"
+            values: ["nvidia-tesla-a100"]
+    podAntiAffinity:                    # 3. 分散部署，避免节点拥塞
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: "job-type"
+              operator: "In"
+              values: ["training"]
+          topologyKey: "kubernetes.io/hostname"  # 只要 hostname 相同（即同一节点），就不允许同时调度
+  containers:
+  - name: trainer
+    resources:                          # 4. Requests = Limits 保证 QoS Guaranteed
+      requests:
+        nvidia.com/gpu: 1
+        memory: "64Gi"
+        cpu: "16"
+      limits:
+        nvidia.com/gpu: 1
+        memory: "64Gi"
+        cpu: "16"
+
+
+
+
+###排查 
+1， kubectl describe pod xxx 查看单个pod，  里面也包含最近很短时间的 events
+2， kubectl get events --sort-by='.lastTimestamp' | grep <相关资源>    看集群全局时间线
+3，kubectl logs pod-name 在 K8s 中，强烈建议应用日志全部打印到标准输出，而不是写在容器内的磁盘文件里，在文件里 logs 命令是看不到的
+
+
+## mertric
+直接用 kube-prometheus-stack Helm Chart 一键安装，它会把 Prometheus Operator、Prometheus、Grafana、AlertManager 全套都部署好
+[Spring Boot App]
+      │
+      ▼ 暴露 /actuator/prometheus
+[Service + 标签]
+      │
+      ▼ 被 ServiceMonitor（ CRD 资源） 选中 
+[Prometheus]  ──定期拉取──► 存储时序数据
+      │
+      ▼ 查询 (PromQL)
+[Grafana]  ──►  Dashboard ID: 14072
+
+## GPU 共享 :对隔离要求高 → MIG；需要灵活共享 → HAMi 或 Time Slicing.  隔离后 pod 互相影响小。
+Time Slicing（时间片）	软件（CUDA 驱动）,
+MPS（多进程服务）	软件（CUDA 驱动）,
+MIG（多实例 GPU）	硬件 ， 是NVIDIA 为 Ampere 架构及之后的高端 GPU（如 A100、H100、H200）提供的硬件级 GPU 分区功能.
+HAMi / vGPU	软件（CUDA API 劫持）,

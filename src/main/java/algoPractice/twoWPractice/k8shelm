@@ -1,0 +1,36 @@
+https://helm.sh/zh/
+Helm is the best way to find, share, and use software built for Kubernetes. go 语言写的，把执行文件放到 bin 里就可以了
+helm create *** 就会创建目录结构：
+--Chart.yaml:  里面的 appversion 就是你这个项目的版本， 里的version 就是这个 chart 的版本，比你改动一部分内容，但是appversion还是一样的。 version 小版本增加一个。
+--charts  这个文件夹表示这个 app 对其他的 chart 的依赖
+--templates  下面就是各种资源的模版
+    ----Notes.txt
+    ----helpers.yaml
+    ----deployment.yaml 引用 values 里的值， 场景包含多种格式 
+                1, {{ .Values.xx.xx}}  直接用 values 里的值
+                2, {{- include “aa.bb” .}} 可以在 helpers.yaml 里能找到对应的 aa.bb 的定义，里面用 if else 这种结构+ values 的引用表达出复杂逻辑。
+                3，{{- with .Values.xx}} 和 - if .Values.xx不同（if 用 xx 的值来判断是否）， with是看 xx 有没有在 Values 里定义。
+                4，{{- if .Values.xx}} 
+                ......
+    ----hpa.yaml
+    ----httproute.yaml
+    ----ingress.yaml
+    ----service.yaml
+    ----servviceaccount.yaml
+    ----tests 
+        ----test-connection.yaml   一般内容是启动一个 busybox 来测试上面的 app pods 服务是否正常。
+----values.yaml   这里面都是 key value（value 是yaml 层级结构） ，key 在其他templates里的 yaml 引用，值就覆盖过去了。 
+
+helm install 后可以 upgrade， 然后还可以 rollback ，不指定特殊版本就是回滚到上一次版本
+artifacthub.io 中很多人上传了 chart。可以直接用，比如 redis 的，mysql 的。 自己根据需求更改 values 里的值。
+
+helm install xx-release . -f xxx-values.yaml   -f 可以指定values 文件，比如 prod， dev 。这样要维护多个版本
+还有 helm 里的 values 不能使用环境变量。
+helm template xx-release 只能展示最新的yaml 里的配置，却不能和已经在线的版本做比较，比较可以用来review 和确认最新的改动。
+
+hemlfile 是基于 heml 的，下载安装后可以支持环境变量， 在下载helm 插件helm diff 就可以查看版本变动，和 git diff 一样详细
+helmfile 最终还是要生成 values.yaml 文件，还是靠 helm 的部署能力。helmfile write-values命令 能生成最终的values 文件，可以查看，检查自己定义的 values 逻辑对不对。
+helmfile 报错不明显，可以用 debug 模式： helmfile template --skip-cleanup 生成的 tmp yaml 文件不会被清除。然后查看。
+
+helmfile template：用于查看 Helm Chart 模板渲染后的最终结果。它会读取你的 helmfile.yaml 和所有 Values 文件，将它们传入 Chart 模板引擎，最终生成完整的、即将部署到 Kubernetes 集群的 YAML 资源清单（如 Deployment、Service 等）。--skip-cleanup 的作用是保留渲染过程中生成的临时文件，方便事后排查。
+helmfile write-values：用于查看最终传给 Helm Chart 的配置值是什么。它不会去渲染 Chart 模板，而是将 helmfile.yaml 中定义的所有环境变量、全局配置和针对每个 Release 的 Values 进行合并和计算，然后输出一个清晰的 Values 文件

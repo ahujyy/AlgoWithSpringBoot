@@ -1,0 +1,49 @@
+#### Cluster Operations & Broker Tuning（集群运维与调优）
+OS:
+1,关闭 Swap 页面交换
+2,vm.max_map_count: 它是 Linux 内核的一个参数，限制了一个进程（如 JVM）可以拥有的最大虚拟内存映射区域（VMA, Virtual Memory Areas）数量.
+     262144 到 655360（26万~65万） 
+    如果 Broker 上存放的分区（Partition）和 Segment 文件非常多，mmap 调用的次数就会超出系统默认值（默认通常仅为 65536），
+    这会导致 Kafka 报 java.lang.OutOfMemoryError: Map failed 错误并直接崩溃（即使你的物理内存和 JVM 堆内存都很充足）。
+3, file-max 1000000 到 2000000（100万~200万）, index 和 .log(数据文件)以及 producer/consumer 的 tcp 连接都占用文件句柄
+
+JVM 层：
+将 GC 算法设置为 G1GC，避免使用过大的 Heap（一般建议 6GB-32GB，保留大量物理内存给 OS Page Cache，因为 Kafka 高度依赖零拷贝 Zero-Copy 和 Page Cache）。
+
+Broker 参数配置： （ network 接收请求 --->  Request Queue ---> io 负责处理读取/写入数据）
+num.io.threads（处理 Disk I/O 的线程数，设为 CPU 核心数）
+num.network.threads（处理网络请求的线程数，设为 CPU 核心数 1~2 倍）
+
+
+#### Zero-Copy 原理：传统模式需要数据在“磁盘 $\rightarrow$ 内核 Page Cache $\rightarrow$ 用户态 JVM 内存 $\rightarrow$ Socket 缓冲区 $\rightarrow$ 网卡”之间拷贝 4 次（包含 4 次上下文切换）。
+#### Kafka 利用 Linux 的 sendfile 系统调用，实现数据直接从 内核 Page Cache $\rightarrow$ 网卡，全程数据不需要经过 JVM 堆内存
+Page cache 是堆外内存。内存映射主要用于 Index（偏移量索引文件） 与 TimeIndex（时间戳索引文件） 的读写。  .log文件被读到Page cache  直接发到网卡。
+
+
+
+### 配置 group.instance.id 开启 Static Membership（静态成员），防止 Pod 滚动更新时频繁触发 Rebalance。
+当该 Consumer 掉线或重启时，Group Coordinator 不会立即将该成员剔除并触发 Rebalance，而是给它留出一个“观察期”（由 session.timeout.ms 决定），
+在不超时的情况下回来了，还是按照个 id 把原来的负责的 partion 给它。
+
+
+###Schema Registry (Confluent / Apicurio) 模式： BACKWARD ， FORWARD， FULL， NONE，（兼容是 consumer 对老的 producer 或者新 produer 来说的） 注册的时候根据模式做 schema 验证，通不过验证就算提前排除掉了潜在的错误。
+更改一个字段的类型， 可以先添加新字段，双写，后面删除老字段。
+producer： 序列化器将 [Magic Byte (1 byte) + Schema ID (4 bytes) + 实际 Avro 序列化二进制数据] 拼接成 Payload，发送给 Kafka。[这样每次不是想像json 那种每次消息带有字段名称]
+当 Kafka 中的数据需要同步到数据湖（Hudi/Iceberg/S3）或数据仓库（Snowflake/ClickHouse）时，Sink Connector 必须知道该 Topic 的列名和数据类型，监控 Schema 服务就好。
+记住的关键点：1， Schema的版本号是在具体的消息里的（writer schema）。 2， consumer 这边可以不认识新字段，但是版本号里（reader schema）的字段必须要有值。
+当 Consumer 读取消息时，Avro 的反序列化器（SpecificDatumReader）会同时传入这两个 Schema：
+反序列化结果 = AvroEngine.read(DataBytes, WriterSchema_V1, ReaderSchema_V2)
+开发者在本地修改 .avsc 文件（生成 V2 源码）----> 使用 Maven/Gradle 插件编译出新的 User.class（内含 V2 的 SCHEMA$ 静态字段）。 运行阶段：Consumer 启动，它内存里硬编码的就是通过 V2 编译出来的 User.class。
+
+
+
+### 缩写 LEO (Log End Offset)[下一个要写入的 offset] 与 HW (High Watermark)。 
+只有当 ISR（In-Sync Replicas，同步副本集合）中的所有 Follower 副本都同步了某条消息后，Leader 才会将 HW 向上推进。   ISR 是为了副本能随时变成 leader 设计的，还有些副本可以多滞后 leader，但是不能是 ISR。
+
+
+
+### . Kafka 性能极高的核心原因
+顺序读写（Sequential I/O）：
+页缓存（Page Cache） （内存映射 ， Kafka 尽可能避免在 JVM 堆内存中缓存数据）
+零拷贝（Zero-Copy）
+批量处理与压缩（Batching & Compression）

@@ -1,0 +1,58 @@
+Dockerfile：
+RUN 层合并[减少层数]、
+利用缓存[多次build 会快]、
+COPY 与 ADD 区别[优先使用 COPY， ADD会自动解压 tar 包或从远程 URL 下载文件]、
+ENTRYPOINT 与 CMD 组合用法 [ENTRYPOINT 是固定部分， 当 docker run image -s , -s 只是能覆盖 cmd 内容作为参数， 并不能改变ENTRYPOINT部分主命令。
+    如果只有 CMD， 没有ENTRYPOINT， CMD 可以带命令。 CMD 是用来做默认参数来使用的。
+    如果定义了ENTRYPOINT， 容器执行的完整命令 = ENTRYPOINT + docker run 后面跟的所有参数。
+]。
+例子：
+# 1. 选择合适的基础镜像（优先 alpine 或 slim 版本）[reference:23]
+FROM python:3.11-slim
+
+# 2. 设置工作目录
+WORKDIR /app
+
+# 3. 先安装系统依赖（变化少，放前面以利用缓存）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        libffi-dev \
+        && \
+    rm -rf /var/lib/apt/lists/*
+
+# 4. 先复制依赖文件（比源码变化少）
+COPY requirements.txt .
+
+# 5. 安装 Python 依赖
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 6. 最后复制源码（最频繁变化）
+COPY . .
+
+# 7. 使用 ENTRYPOINT + CMD 组合
+ENTRYPOINT ["python"]
+CMD ["app.py"]
+
+Image 被一层一层叠加，每一层对应一个文件路径，被下载到Node主机上后，最终让runc调用内核，用OverlayFS技术合并成一个虚拟的目录视图，挂载到 /container/rootfs 这个位置。
+mount -t overlay overlay \
+    -o lowerdir=/snapshots/layer1/fs:/snapshots/layer2/fs:..., \
+       upperdir=/containers/<container-id>/upper/fs, \
+       workdir=/containers/<container-id>/work/ \
+    /run/containerd/.../rootfs
+lowerdir  对应 image里构建的安装的文件，只可读。当容器启动时，Containerd 会为容器创建一个新的空目录作为 upperdir。为可写层。
+
+
+# Bridge 模式（默认，无需指定）  8080:80 端口映射宿主机 8080 到 container 80
+docker run -p 8080:80 nginx
+# Host 模式（需显式指定） 也就是 container 不单独开辟 NetNS，加入宿主机根 Network Namespace.
+docker run --network host nginx
+
+docker volume  相当于 kubernetes pvc/pv
+生产数据库，数据极其重要，必须持久化存储在宿主机磁盘；容器升级删除时，数据绝对不能丢
+    docker volume create mysql-data
+    docker run -v mysql-data:/var/lib/mysql mysql:8.0
+
+docker bind mount(绑定挂载) 相当于 Kubernetes 里的hostPath ，不推荐。bind mount 宿主机的路径下内容会覆盖 container 里对应路径下的内容。
+你希望修改本地 index.js，容器内的 Node 服务立刻重启生效，不想重新 Build 镜像: /my/local/code 绝对路径
+    docker run -v /my/local/code:/app -p 3000:3000 node:18    

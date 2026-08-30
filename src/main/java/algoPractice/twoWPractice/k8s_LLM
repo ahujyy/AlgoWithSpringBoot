@@ -1,0 +1,127 @@
+Device Plugin 让 Kubernetes 能够“感知”到 GPU 的存在，并把 GPU 变成像 CPU、内存一样可以被 Pod 申请和调度的标准资源. 需要安装。
+k8s没有为 GPU 专门设置一个资源类型字段,而是通过一种叫作 Extended Resource（扩展资源） 的机制来支持
+
+三步流程：
+1， 节点打标签（注意是label nodes） + 安装 NVIDIA 驱动  
+2， 部署 NVIDIA Device Plugin（NVIDIA GPU Operator 一键部署） 
+3，在 Pod 中声明 GPU 资源请求
+    apiVersion: v1
+    kind: Pod
+    metadata:
+    name: gpu-pod
+    spec:
+    # 1. 通过 nodeSelector 精准调度到有 GPU 的节点（可选但推荐）
+    nodeSelector:
+        nvidia.com/gpu.present: "true"
+    # 2. 通过 tolerations 允许进入打了污点的 GPU 节点（如果节点有污点的话）
+    tolerations:
+    - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+    containers:
+    - name: cuda-app
+        image: nvidia/cuda:11.0-base
+        resources:
+        limits:
+            nvidia.com/gpu: 1   # 申请 1 块 GPU[reference:15][reference:16]
+        command: ["nvidia-smi"]
+
+nodeSelector + tolerations 解决的是“Pod 能不能进入 GPU 节点”的问题；limits： nvidia.com/gpu: 1 解决的是“Pod 进入后能不能真正用上 GPU”的问题。两者缺一不可
+
+
+ GPU 共享和 MIG 的基本概念， GPU 共享与切分 方案：
+ 1， 软件（CUDA 驱动）切分： 
+    1.1 Time Slicing（时间片）软件（CUDA 驱动）， 像多线程共享 cpu 时间片。
+    1.2 MPS（多进程服务） 软件（CUDA 驱动）， 部分隔离， 比 time slcing 稳定。
+ 2,硬件驱动切分： Multi-Instance GPU） MIG 以物理方式将一块 GPU 切分成多个独立的实例，每个实例都有专用的计算核心（SM）、显存和缓存 。 
+    缺点：如果某个分区处于空闲状态，相邻分区无法“借用”它的计算资源（隔离性）。 适用于 生产环境、多租户
+ 3，HAMi / vGPU —— K8s 原生 GPU 共享方案 HAMi（Heterogeneous AI Computing Virtualization Middleware）
+    它通过劫持 CUDA API 调用，在软件层实现 GPU 虚拟化。灵活性高
+    除了 nvidia.com/gpu，还支持 nvidia.com/gpumem（显存大小，MiB）和 nvidia.com/gpucores（算力百分比，1-100）。需要灵活、细粒度的 GPU 资源共享，但不想受限于 MIG 固定切分大小的场景。
+
+
+大模型如何应对高并发？
+面对高并发，LLM 服务并非简单地增加 Pod 数量，主要有两种策略：
+
+策略一：聚合推理 (Aggregated Inference)
+在单个 Pod 内使用并发批处理技术。一个 Pod 收到多个请求后，将它们打包成一个批次送给 GPU 计算，同时处理，从而提升吞吐量。
+
+策略二：分解推理 (Disaggregated Inference)
+这是为解决超大模型和高并发而生的高级模式。它将 LLM 的推理过程拆分为预填充（Prefill，计算密集型） 和解码（Decode，内存带宽密集型） 两个阶段，分别部署到不同的 Pod 甚至不同的 GPU 上。
+优点：可以独立扩展两个阶段的 Pod 数量，实现资源的最优利用和更灵活的扩缩容。
+实现：这需要 NVIDIA Dynamo 等专门的框架和 Kubernetes 的分组调度能力来协同调度一组 Pod。
+
+总的来说：小规模或初期，用聚合推理足够。大规模生产环境，分解推理是未来的趋势。
+
+
+
+ONNX[Open Neural Network Exchange（开放神经网络交换）] Runtime : 一个跨平台的推理引擎
+TensorRT: NVIDIA 专为自家 GPU 打造的高性能推理优化器
+
+Triton Inference Server：由NVIDIA开发的开源推理服务软件，是一个模型部署和管理的平台。
+
+
+PyTorch / TensorFlow 通用计算框架（开发/训练）
+vLLM (以及 HuggingFace Transformers) 专用推理框架（部署/服务）
+
+
++-----------------------------------------------------------------------------------+
+| 1. 接入层 (外部请求)                                                               |
+|    [客户端/API Gateway]  ->  HTTP/gRPC 请求                                        |
++-------------------------------------+---------------------------------------------+
+                                      | (请求路由)
+                                      v
++-----------------------------------------------------------------------------------+
+| 2. 服务编排层 (大管家 - 负责管理)                                                   |
+|    [Triton Inference Server]                                                       |
+|    - 职责：管理模型仓库、处理并发请求、动态批处理(Batching)、版本切换                |
+|    - 位置：**模型的外部**，独立的 Pod/进程                                          |
++-------------------------------------+---------------------------------------------+
+                                      | (调用后端接口)
+                                      v
++-----------------------------------------------------------------------------------+
+| 3. 高性能推理框架层 (工人 - 负责计算调度)                                           |
+|    [vLLM  /  HuggingFace Transformers]                                             |
+|    - 职责：管理 KV Cache 显存 (PagedAttention)、调度请求队列、执行生成算法          |
+|    - 位置：**模型的直接外部**，它加载模型权重                                       |
++-------------------------------------+---------------------------------------------+
+                                      | (调用底层算子)
+                                      v
++-----------------------------------------------------------------------------------+
+| 4. 底层推理引擎层 (发动机 - 负责驱动硬件)                                           |
+|    [TensorRT  /  ONNX Runtime]                                                     |
+|    - 职责：将模型结构编译为 GPU 汇编代码、算子融合、显存池管理                      |
+|    - 位置：**直接运行在 GPU 驱动之上**，操纵硬件                                   |
++-------------------------------------+---------------------------------------------+
+                                      | (CUDA 驱动)
+                                      v
++-----------------------------------------------------------------------------------+
+| 5. 硬件层                                                                          |
+|    [NVIDIA GPU (显存 + 计算核心)]   <----  [大模型权重文件 (.safetensors)]          |
+|                                          (静态数据，被加载到显存中)                |
++-----------------------------------------------------------------------------------+
+
+
+
+=========================项目 QA=============================
+项目名称：基于 K8s 的电商图片识别推理服务部署
+
+用 Helm 创建一个 Chart，包含一个 Triton Inference Server 部署（可用官方示例模型），请求资源 nvidia.com/gpu: 1，并设置探针。
+前端接一个 Java 网关（你熟悉的 Spring Boot），负责接收 HTTP 请求、做参数校验、调用 Triton 的 gRPC 端点，并把结果写回 Redis。
+利用 KEDA + Redis Scaler，当队列积压超过阈值时自动扩容推理 Pod，空闲时缩容到 0。
+编写 Ingress 规则，实现 API 网关和推理服务的不同域名/路径路由。
+
+
+Kubernetes Event-driven Autoscaling（Kubernetes 事件驱动自动伸缩）
+它是 Kubernetes 官方的“外部触发器”。HPA（Horizontal Pod Autoscaler）只能看 CPU/内存，但 KEDA 可以监控 Redis 队列长度、Kafka 消息积压、MySQL 连接数等外部事件。
+当队列里有 100 个任务时，它直接修改 Triton Deployment 的 replicas 字段，拉起 Pod；任务处理完，缩容到 0（省 GPU 钱）。
+KEDA 的 Redis Scaler 每隔几秒执行 LLEN queue-name（查询列表长度），检查积压的未处理任务数。当积压超过阈值（如 50 个），触发扩容
+redis 角色：
+角色一：结果缓存。Spring Boot 推理完后，把 (图片Hash -> 推理结果) 存进 Redis。下次请求同一图片，直接返回，不走 Triton。
+角色二：任务队列 (Job Queue)。这是 KEDA 监控的核心。当流量突增时，Spring Boot 不直接调用 Triton，而是把“待处理的图片任务”作为一条消息 LPUSH（左推） 进 Redis List。
+        Triton 处理完一个，就 RPOP（右弹） 下一个。
+
+Java 网关伸缩看 QPS（CPU），Triton 伸缩看队列深度（业务负载），两者互不干扰。
+
+
+
