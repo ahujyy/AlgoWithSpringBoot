@@ -1,0 +1,258 @@
+1, 在百万QPS 场景下（高并发）， 如何优化 java 堆内内存分配？ 如何避免频繁 GC 导致的服务抖动？
+    a.单机无法支撑百万 QPS，单节点可以承受5,000 ~ 10,000 QPS, 假设单次请求10KB， 单节点每秒就会产生 50MB ~ 100MB 的垃圾。
+    b.分配策略： 减少分配 与 加速分配
+        b.1 减少分配：
+            b.1.1 高频代码的无逃逸设计。在百万 QPS 的热点路径上，尽量编写局部作用域的方法，避免把临时对象 return 或者是赋值给外部变量，从而主动让 JIT(just-in-time) 的标量替换生效，从源头消除堆内存分配.
+            b.1.2 对象复用与池化（Object Pooling). 如： Apache· commons 里GenericObjectPool。  还有利用Threadlocal 存 builder 或者buffer 。
+                   ThreadLocal<StringBuilder> BUFFER_HOLDER = ThreadLocal.withInitial(() -> new StringBuilder(1024))
+            b.1.3 堆外内存（Off-Heap）与零拷贝: IO 序列化用 Protocol Buffers (Protobuf) 或 Kryo / FastJSON2 替代传统 JSON.
+        b.2 加速分配
+            利用TLAB（Thread Local Allocation Buffer）加速分配，适度调大 -XX:TLABSize，避免高频请求下 TLAB 快速耗尽导致退化回 Eden 区 CAS 竞争分配。
+    c.减少高并发下导致服务抖动（P99 飙高）
+        主要原因： STW（Stop-The-World）时间过长 以及 对象过早晋升（Premature Tenuring）引发的全量 GC 或并发收集跟不上分配速度
+        c.1 gc 选择： 
+            c.1.1 JDK 17+ 强烈推荐 ZGC（Generative ZGC 在 JDK 21 正式引入）. ZGC 实现了 Concurrent Mark/Compact，STW 控制在 1ms 以内
+            c.1.2 JDK 8 / 11，建议使用 G1GC. "显式"设置最大暂停时间目标 -XX:MaxGCPauseMillis=20.  如果你不设置，G1 收集器可能会等 Eden 区满了、甚至老年代积压了很多垃圾才去收集，结果一次 GC 停顿了 200ms ~ 500ms！
+                    在这 500ms 内，百万 QPS 系统会有成千上万个请求全部超时卡死，产生严重的服务 P99 抖动
+        c.2 避免“对象过早晋升”导致老年代频繁 GC:
+            c.2.1 调大动态年龄判定空间 -XX:TargetSurvivorRatio=80, 默认是 50%.
+                    (如果某次 GC 后，Survivor 区中同年龄对象大小的总和大于 Survivor 空间的一半，年龄大于等于该年龄的对象，不需要等到 15 次，直接全部强行晋升到老年代)
+            c.2.2 增大年轻代（Young Generation）比例
+            c.2.3 避免大对象（Humongous Objects）直接分配. 限制单次 RPC / HTTP 请求的 Payload 大小（例如限制最大 1MB），
+                    采用分块传输（Chunked Transfer）或分页 Fetch，将大 JSON 解析拆解成流式处理
+
+    把 Young 区调大了，单次 Minor GC 的停顿时间变长了，抖动不就更严重了吗？怎么解决？
+    这就是为什么在百万 QPS 场景下，我们不能单独调节内存占比，必须配合垃圾回收器（GC Collector）的选型升级：
+
+    如果使用传统 G1GC：
+    我们通过 -XX:SurvivorRatio=6 或 4 适当扩大 Survivor 空间(默认是 8)，并把动态判定阈值 -XX:TargetSurvivorRatio=80 提高，防止短命对象误入老年代；
+    同时将 -XX:MaxGCPauseMillis=20 设小，让 G1 自动通过控制 Region 数量来抵消 Young 区变大带来的 STW 增加。
+
+    如果升级到 ZGC（JDK 17/21）：
+    ZGC 实现了 Concurrent Mark/Compact，单次 GC 停顿时间与堆大小和存活对象数量无关（始终 <1ms）。
+    此时我们可以放心地把 Young 区给大（在 Generative ZGC 中），彻底享受到‘超大年轻代带来的极低 GC 频率’，同时完全不用担心 Young 区变大带来的 STW 停顿副作用！”
+                
+
+2, 在高吞吐场景下， 如何配置 G1 gc 以减少 STW？ 如何通过 GC 日志分析内存泄露？
+    a. 高吞吐，又要减少 STW，即低延迟，既要又要。 其实是在不改变高吞吐情况下偏向低延迟
+        a.1 设定合理的目标暂停时间（不要盲目设太低）-XX:MaxGCPauseMillis=20 ~ 50 
+        a.2 提前触发并发标记（IHOP），防止来不及回收直接爆堆。
+            -XX:InitiatingHeapOccupancyPercent=45   老年区分配占整堆 45%（默认值）后就触发并发标记（g1 并发标记会同时检查 young 和old， 计算垃圾百分比，后面决定哪些划算而去回收）
+            -XX:+G1UseAdaptiveIHOP  自适应算占比，最开始用InitiatingHeapOccupancyPercent的值，因为没有足够历史数据参考。
+    
+    b. 识别 GC 日志中的内存泄漏“三大典型征兆”: 1. ull GC / Mixed GC 后，老年代（Old Gen）占用率呈现“阶梯式上升” 2.GC 触发频率越来越密集，且单次 GC 效果越来越差 3.日志中频发出现 Humongous Allocation 相关的垃圾回收
+        确认泄漏后(上面三现象)，不直接 Dump 全量堆，而是结合 jmap -histo:live 增量对比与 JFR 诊断工具的 Old Object Sample 采样，精准沿着 GC Root 引用链追踪到具体的代码泄露点（如未清理的 ThreadLocal 或无限增长的本地集合）。”
+        b.1 开启详细 GC 日志（分析卡在哪一步哪一阶段）
+        b.2 避免 dump 造成生产事故。 用 jmap -histo:live <pid> 查看堆内存活对象的类名、数量与占用空间排行.(jmap -dump:live fullgc 后遍历整个堆，写完 dump 文件才恢复。 histo 是 fullgc后遍历剩余对象统计后恢复，大概几秒)
+            # 连续间隔 5 分钟打印两次存活对象排行，对比增量变化 （Histogram 直方图）
+            jmap -histo:live <pid> | head -n 20
+        b.3 极小开销排查：使用 JFR（Java Flight Recorder）重点推荐
+            jcmd <pid> JFR.start name=LeakAnalysis settings=profile duration=300s filename=leak.jfr
+            在 JFR 分析工具（JDK Mission Control）中查看 Old Object Sample（老年代采样）
+
+    jmap 偏向于 “静态的内存物理快照分析”（专注于：“堆里现在到底装了什么对象？占了多少内存？”）；
+    jcmd 偏向于 “动态的 "JVM 运行时"(堆内存 + 线程栈 + Metaspace + DirectBuffer（堆外）+ C-Heap (JNI) + CodeCache)控制与全景诊断”
+    （专注于：“JVM 整体内存（包含堆外）是怎么分布的？CPU/线程在干什么？JFR 轨迹是什么？”）。
+
+
+
+3, 在 kubernetes 集群中， 如果针对 java 应用优化容器资源分配，如何避免 gc 与 crgroup 的冲突
+    从K8s 维度、JVM 内存感知 和 GC 选型调优 三个层面协同设计。java8 大部分版本无法识别 Cgroup 限制，会读取宿主机的 CPU 核心数和总内存，导致 GC 线程开得过多、堆内存默认设得过大
+    
+    3.1. 针对 Java 应用优化容器资源分配（3条）
+        3.1.1 内存预留 30% 缓冲：堆内存（-Xmx）最多占用容器 limits.memory 的 70%，剩余 30% 留给元空间、线程栈和堆外内存。
+        3.1.2 或者使用百分比自适应：设置 -XX:InitialRAMPercentage=70.0 -XX:MaxRAMPercentage=70.0 "代替写死的 -Xms/-Xmx。"
+        3.1.3 保证内存配置等额：设置 requests.memory == limits.memory，减少 K8s 节点动态调度带来的内存驱逐和抖动。
+        3.1.4 可以考虑预留 Metaspace 与 DirectMemory 上限
+            -XX:MetaspaceSize=256m
+            -XX:MaxMetaspaceSize=512m
+            -XX:MaxDirectMemorySize=1g
+    3.2 避免 GC 与 Cgroup 冲突（3条）
+        3.2.1 显式感知容器限制：确保使用 JDK 8u191+ / JDK 11+（默认开启 -XX:+UseContainerSupport），防止 JVM 误将宿主机内存当成容器可用内存。
+        3.2.2 消除 CPU 节流 (CFS Throttle)[Completely Fair Scheduler（完全公平调度器)]：
+                给足 requests.cpu，尽量不设或放宽 limits.cpu；或适当调小 GC 线程数（-XX:ParallelGCThreads），防止并行 GC 瞬间吃满周期配额而被内核挂起。
+        3.2.3 防止探针误杀 STW 容器：放宽 K8s livenessProbe（存活探针）的 failureThreshold（失败次数）与 timeoutSeconds（超时时间），防止长 GC STW 时 Pod 被 K8s 误判死亡而强行重启。
+
+
+4, 在跨境支付场景下，如何用 TCC 模式实现跨银行账户的资金转移，如何处理补偿事务的幂等性. TCC（Try-Confirm-Cancel）
+    传统的本地事务或强一致性的两阶段提交（2PC）无法跨越机构边界.  2pc 是 DB 支持， TCC 需要自己实现。
+    主要是通过 唯一凭证ID + 状态机
+    
+    4.1 跨行转账1000块：
+        try: 
+            转出行： 可用余额 = 可用余额 - $1000，冻结余额 = 冻结余额 + $1000。
+            转入行： 校验账户合规性与额度
+        confirm:
+            转出行：冻结余额 = 冻结余额 - $1000 ,标记成功
+            转入行：可用余额 = 可用余额 + $1000 ，标记成功
+        cacel: 如果失败
+            转出行： 可用余额 = 可用余额 + $1000，冻结余额 = 冻结余额 - $1000
+            转入行：清除待入账中间户中的预扣/预留记录
+    4.2 与幂等性/补偿处理
+       4.2.1 状态表 global_tx_id + status（TRYING, CONFIRMED, CANCELED） 数据库global_tx_id 唯一键。 更新的时候带上状态条件。
+       4.2.2 空回滚（Empty Rollback）。 cancel 比 try 先来， 查不到任何 Try 的记录，插入一条状态为 CANCELED 的记录，并向协调器返回 SUCCESS（告诉协调器我已经成功回滚了，不用再重试）
+       4.2.3 悬挂（Anti-Hanging / Suspended Try）， try 来了，查询已经有global_tx_id，且状态是 CANCELED。 直接拒绝/拒绝执行该 Try，不冻结任何资金，也就是忽视。 
+
+
+5， 在证券交易系统中， 如果和保证 rocketMQ 消息的顺序与 exactlyonce 语义， 如何处理消息积压
+    原则： 全局无序，分区（Queue）有序
+    5.1 生产端： 实现MessageQueueSelector， 账户/订单的 Hash 值路由到同一个 Queue。  发送有 ack 机制， 先发送的 msg 有 ack 了才会发送下一条， 保证同一个分区的消息顺序。
+    5.2 消费端： 消费端：使用 MessageListenerOrderly。 锁定 Queue 的线程进行并发控制，保证同一时刻同一个 MessageQueue 只有一个线程在消费。
+    5.3 exactlyonce 语义： RocketMQ 的 At-Least-Once 传输 + 消费端业务层幂等（Idempotency）/ 状态机。
+    5.4 处理消息积压
+        5.4.1 ，消息可以无序， 直接增加消费端的实例，比如 Pod
+        5.4.2， 消息是有序的，部署“转发者（Router）”程序，重新通过 hash， 高吞吐地把消息重写入 Topic_Temp，Topic_Temp有更高的分区，然后消费。
+        5.4.3， 消费端性能优化
+            5.4.3.1 批量处理消息，比如插入 db 操作用 batch ，加快吞吐
+            5.4.3.2 剥离耗时操作， 比如异步处理 IO。
+        5.4.4 影响前端用户的： 限流排队，或者优先处理紧急的
+
+
+6， 在高并发系统中，如何正确使用 completeableFuture 与 reactor 进行异步编程。 如果避免回调地狱？
+    CompletableFuture 单次/有限次数的异步任务编排（Push 模型，Future-based）
+    Project Reactor（Flux / Mono） 响应式数据流处理与"全链路非阻塞"架构（Push-Pull 结合模型）。 支持反压机制， 真正的“非阻塞 (Non-blocking)”[这点受到 jdk21 的虚拟线程挑战]
+    回调地狱 / 嵌套地狱:  thenAccept 返回的是CompletableFuture<Void>。
+
+    getUserAsync(userId).thenAccept(user -> {
+        getOrdersAsync(user).thenAccept(orders -> {
+            getPaymentAsync(orders).thenAccept(payment -> {
+                // 代码一层套一层，极其难维护，且异常无法统一捕获
+            });
+        });
+    });
+
+    6.1
+    completeableFuture 使用算子:    thenCompose / thenCombine。 
+        thenCompose（相当于 flatMap）：用于有依赖关系的串行异步任务（任务 B 依赖任务 A 的结果）。
+        thenCombine / allOf：用于无依赖关系的并行异步任务。
+    reactor 使用算子：   flatMap / zip / concatMap
+    // ✅ 正确示范：链式平铺 + 异常统一处理
+    CompletableFuture<PaymentInfo> result = getUserAsync(userId)
+    // thenCompose 相当于 flatMap，打平嵌套的 Future
+    .thenCompose(user -> getOrdersAsync(user))
+    .thenCompose(orders -> getPaymentAsync(orders))
+    .exceptionally(ex -> {
+        // 统一降级/异常处理
+        log.error("Failed to process payment for user: {}", userId, ex);
+        return PaymentInfo.empty();
+    });
+
+    6.2 高并发系统最佳实践
+        6.2.1 . 线程池隔离（千万不要共用 ForkJoinPool.commonPool）
+        6.2.2 响应式系统中的“阻塞杀手”，不要执行链中调用任何阻塞 API（如 Thread.sleep、JDBC、阻塞式 HttpClient）。
+        6.2.3 严格的超时与熔断机制 JDK 9+ 必须加上 .orTimeout(timeout, unit) 或 .completeOnTimeout(...)。
+        6.2.4 异常处理与 TraceId 传递（MDC 丢失问题）.依赖于 threadlocal 的变量因为多线程处理丢失。
+    
+    6.3 CompletableFuture 常用算子
+        import java.util.concurrent.*;
+
+        public class CompletableFutureOperatorsDemo {
+
+            public static void main(String[] args) throws Exception {
+                ExecutorService executor = Executors.newFixedThreadPool(4);
+
+                // -------------------------------------------------------------
+                // 1. 创建算子（如何启动一个异步任务）
+                // -------------------------------------------------------------
+                // supplyAsync: 有返回值
+                CompletableFuture<String> task1 = CompletableFuture.supplyAsync(() -> {
+                    return "User_101";
+                }, executor);
+
+                // runAsync: 无返回值 (Runnable)
+                CompletableFuture<Void> initTask = CompletableFuture.runAsync(() -> {
+                    System.out.println("初始化配置...");
+                }, executor);
+
+
+                // -------------------------------------------------------------
+                // 2. 转换/转换算子（单个 Future 的平铺与映射）
+                // -------------------------------------------------------------
+                // thenApply (相当于 map): 对上一步的结果进行转换，返回新值
+                CompletableFuture<Integer> nameLengthFuture = task1.thenApply(name -> name.length());
+
+                // thenCompose (相当于 flatMap): 上一步的结果作为参数，发起【一个新的异步任务】
+                CompletableFuture<String> userDetailFuture = task1.thenCompose(userId -> 
+                    CompletableFuture.supplyAsync(() -> "Detail_For_" + userId, executor)
+                );
+
+
+                // -------------------------------------------------------------
+                // 3. 消费/终结算子（只接收结果，不产生新值）
+                // -------------------------------------------------------------
+                // thenAccept: 消费上一步的结果
+                task1.thenAccept(name -> System.out.println("拿到用户名: " + name));
+
+                // thenRun: 不关心上一步的结果，只要它完成了就执行后续动作
+                task1.thenRun(() -> System.out.println("Task1 执行完毕！"));
+
+
+                // -------------------------------------------------------------
+                // 4. 组合算子（多个 Future 的并行协同）
+                // -------------------------------------------------------------
+                CompletableFuture<String> futureA = CompletableFuture.supplyAsync(() -> "A");
+                CompletableFuture<String> futureB = CompletableFuture.supplyAsync(() -> "B");
+
+                // thenCombine: 等待两个 Future 都完成，将它们的结果合并
+                CompletableFuture<String> combined = futureA.thenCombine(futureB, (a, b) -> a + " + " + b);
+                System.out.println("Combined: " + combined.get()); // 输出: A + B
+
+                // allOf: 等待【全部】任务完成（适合批量并行请求）
+                CompletableFuture<Void> allTasks = CompletableFuture.allOf(futureA, futureB);
+                allTasks.thenRun(() -> System.out.println("A 和 B 都完成了！"));
+
+                // anyOf: 只要【任意一个】任务完成就返回（适合求快/备用节点查询）
+                CompletableFuture<Object> fastest = CompletableFuture.anyOf(futureA, futureB);
+
+
+                // -------------------------------------------------------------
+                // 5. 异常处理与超时算子
+                // -------------------------------------------------------------
+                CompletableFuture<String> exceptionTask = CompletableFuture.supplyAsync(() -> {
+                    if (true) throw new RuntimeException("服务异常！");
+                    return "OK";
+                });
+
+                // exceptionally: 捕获异常并返回降级默认值 (相当于 try-catch)
+                CompletableFuture<String> fallbackTask = exceptionTask.exceptionally(ex -> {
+                    System.err.println("发生错误: " + ex.getMessage());
+                    return "Fallback_Default_Value"; // 降级结果
+                });
+
+                // orTimeout (JDK 9+): 强制设置超时时间
+                CompletableFuture<String> timeoutTask = CompletableFuture.supplyAsync(() -> {
+                    try { Thread.sleep(2000); } catch (InterruptedException e) {}
+                    return "Slow Data";
+                }).orTimeout(500, TimeUnit.MILLISECONDS) // 500ms 超时直接抛 TimeoutException
+                .exceptionally(ex -> "Timeout Fallback");
+
+                System.out.println("Timeout Result: " + timeoutTask.get());
+
+                executor.shutdown();
+            }
+        }
+
+    6.4 CompletableFuture 理解： 
+            Function<T, R> 转换/映射 (Map)， 有输入和输出。核心方法 R apply(T t)
+            Consumer<T> 消费/终止 (Consume)， 有输入没有输出。核心方法void accept(T t)
+            Supplier<T> 供给/生成 (Supply) ，无输入有输出， 核心方法 T get()
+        所以 thenApply(Function<T, R> fn)， thenAccept(Consumer<T> action)
+
+        thenApply 与 thenCompose 的核心区别不是 后面的函数是不是大概率重新提交到线程执行，还是在当前 task 的 work 线程执行。
+            当当前 future 已经有结果时， thenApply 和thenCompose 都会在当前调用主线程执行，如果没有，就挂到 task 的 worker 线程执行，
+            [只是thenCompose里的函数执行会快，因为thenCompose 后面的函数是要返回CompletableFuture, 是要异步执行。]----错误，thenCompose 的函数也可能先执行很多逻辑，最终才提交异任务返回CompletableFuture
+            如果要剪除当前主线程允许的可能性，直接用thenApplyAsync/thenComposeAsync
+        thenApply 与 thenCompose 的核心区别 是 如果转换函数的返回只是CompletableFuture，只能用thenCompose。
+         用thenApply就变成CompletableFuture<CompletableFuture<U>>,所以需要thenCompose 这种 flatmap 功能。
+            CompletableFuture<User> getUserAsync(String userId);     // 异步获取用户
+            CompletableFuture<Order> getOrderAsync(User user);       // 异步获取订单
+            // ❌ 如果用 thenApply，会产生二阶嵌套，类型变复杂：
+            CompletableFuture<CompletableFuture<Order>> nestedFuture = 
+                getUserAsync("1001").thenApply(user -> getOrderAsync(user));
+
+            //  如果用 thenCompose，自动扁平化打平，直接拿到单层 Future：
+            CompletableFuture<Order> orderFuture = 
+                getUserAsync("1001").thenCompose(user -> getOrderAsync(user));
+
+
+        

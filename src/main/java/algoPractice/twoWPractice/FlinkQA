@@ -1,0 +1,49 @@
+Q1: 
+    Flink 发生背压怎么定位问题。
+A1: 
+    1， Flink Web UI 定位高背压的算子，下游往上游传递，找最下游的高背压算子。
+    2， 对找到怀疑算子的 taskmanager， 对它在 Web UI 上进行 ThreadDump，如果有java.net.SocketInputStream.read
+     卡住在 外部 IO 上。可以用 flink Async I/O 或者缓存缓解。如果卡在某个逻辑，可能 cpu 不够用
+    3， 对比 各个 subtask， 看bytes received/ records reviced, 如果某个 subtask 明显大于其他，有数据倾斜。
+    4， Flink Dashboard 或 Prometheus 看 JVM 状况， 看是否长期 full gc。
+
+
+
+Q2：
+    Flink Barrier 会不会影响秒级响应？
+A2：
+    普通情况下不会，当算子收到 Barrier 并完成本地状态对齐/快照触发（把内存中的数据【rocksDB 或者 内存 hashmap】 state 持久化到 /tmp/xx 目录）很快。
+    耗时的把checkpoint 文件同步到 S3 是异步的。
+    多输入算子（如 Join / CoFlatMap）如果一个算子 channel收到Barrier后暂停处理，需要等待其他算子的Barrier出现，会增加点延迟。
+    但是高背压的情况， 处理数据是 FIFO， Barrier得不到处理，checkpoint 会超时失败。
+    开启非对齐 Checkpoint（Unaligned Checkpoints）：execution.checkpointing.unaligned = true。 
+
+    对齐 Checkpoint:    快照内容 = 算子 State
+    非对齐 Checkpoint:  快照内容 = 算子 State + Channel Input Buffer 里的未处理数据 + Output Buffer 里的未发送数据
+
+    这样磁盘 IO 变高， 持久化存储开销增大，恢复时从 S3拉取数据时间变长。 
+
+Q3: 
+    flink 大 state 怎么解决
+
+A3:
+    [大 State 问题] ──> [1. 存储底层调优] ──> RocksDB 内存/磁盘优化 + 增量 CP
+                            RocksDB 生成 SST（Sorted String Table）文件，开启增量后，CP 只上传本次新增或修改的 SST 文件，对于历史未变动的 SST 文件仅建立引用
+                            这样会导致当前cp 会依赖以前的 cp。 必须合理配置 state.backend.rocksdb.memory.managed: true，让 Flink 托管 RocksDB 内存，防止堆外内存溢出（OOM Kill），
+                            flink会控制内存大小，自动压盘（Flink 底层使用的是高度定制化的 FRocksDB）
+                 ──> [2. 状态源头瘦身] ──> TTL + 数据结构优化(只存有用的数据) + 减小窗口
+                 ──> [3. 资源与并行度] ──> Key 重新打散 + 增加并行度 + 拆分算子
+                    key打散是为了没有倾斜， 让state的均匀分布
+                 ──> [4. 架构高级特性] ──> Claim Mode + Changelog (Flink 1.15+)
+
+    当 State 达到 G/T 级别时，必须且只能选择 RocksDB StateBackend（嵌入式 Key-Value 数据库，基于 LSM-Tree，数据保存在 TaskManager 的本地磁盘而非 JVM 堆内）。
+    
+    
+    Log Sequence Number (LSN)：算子获取当前已持久化的 Log 最新偏移量.  Log在转化为state后就可以删除了。
+    changelog checkpoint：  Full State Snapshot = Base State (SST / Heap) + sum Changelog(LSN_base ---》 LSN_cp)
+    故障恢复会有额外花销： 顺序回放（Replay）：本地算子以极高的吞吐重新执行 Log 中的修改指令（Set/Remove），将状态追加更新到本地 RocksDB 中（checkoupoint : SST 物理文件 + 未物化的 Change Log 流)
+
+
+    Flink Changelog 的设计思想确实与 HBase (WAL + MemStore + HFile) 以及 LSM-Tree 数据库的架构高度相似。
+    HBase：写 WAL (保证不丢) ----> 写 MemStore (内存高吞吐) ----> 异步 Flush 到 HFile (持久化)。
+    Flink Changelog：写 StateChangelog (保证 CP 毫秒级落盘) ----> 写 本地 State Table (内存/RocksDB 高吞吐) ----> 异步 Materialization (生成基线快照)。

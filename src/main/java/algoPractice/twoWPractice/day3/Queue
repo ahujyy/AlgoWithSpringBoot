@@ -6,7 +6,7 @@
 /**
 private final ReentrantLock lock = new ReentrantLock();
 private final Condition notEmpty = lock.newCondition(); // 核心：空队列的等待队列
-当线程调用 take() 发现队列为空时，它会调用 notEmpty.await()，把自己挂起并放入这个条件队列里。
+当线程调用 take() 发现队列为空时，它会调用 notEmpty.await()，把自己挂起并放入这个条件队列里。(await()必须是先已经拿到锁，然后释放，阻塞住线程，被唤醒才去重新尝试拿锁)
 
 当有新元素通过 put() 或 offer() 进来时，会调用 notEmpty.signal()，把挂起的消费者线程唤醒。
 
@@ -15,7 +15,7 @@ private final Condition notEmpty = lock.newCondition(); // 核心：空队列的
 ### PriorityQueue 和 PriorityBlockingQueue 队列内容排序的时候，可以用事先构造队列的时候就定义的Comparator 来排序。 复杂逻辑在 compareTo 方法里去实现。
 
 ### 其他常见 blockingQueue
-ArrayBlockingQueue：基于数组的有界阻塞队列，必须指定大小，一把锁。
+ArrayBlockingQueue：基于数组的有界阻塞队列，必须指定大小，一把锁。（基于数组实现的有界环形队列，只用了一把 ReentrantLock，搭配两个 Condition（notEmpty 和 notFull）。）
 
 LinkedBlockingQueue：基于链表的阻塞队列（可有界可无界），使用了两把锁（takeLock 和 putLock），实现了读写分离，性能明显优于 ArrayBlockingQueue。
 
@@ -43,6 +43,10 @@ PriorityQueue：我们刚聊过的标准二叉堆。没有锁，单线程排序�
 
 LinkedList：老牌链表，它不仅实现了 List，还实现了 Deque 接口，可以当队列用，但由于每个节点都是独立对象，GC 压力大，现在很少推荐单纯作为队列使用。
 
+
+对应实现：ReentrantReadWriteLock 将 AQS 的 state 变量一分为二：高 16 位：表示读锁状态（共享锁持有计数）。低 16 位：表示写锁状态（独占锁重入计数）。 它内部成员变量Sync sync 继承 AQS
+    锁降级（Lock Downgrading）：允许线程先获取写锁，再获取读锁，然后释放写锁（从写锁“降级”为读锁），但不支持锁升级（防止死锁）。
+
 ### 选型
 总结：架构师的选型心法
 什么时候选非阻塞（ConcurrentNonBlocking）？
@@ -51,6 +55,22 @@ LinkedList：老牌链表，它不仅实现了 List，还实现了 Deque 接口�
 什么时候选阻塞（Blocking）？
 当涉及到跨越系统边界、硬件限制（如磁盘、网络、数据库读写能力有限），需要借助队列来做流量削峰、限流、线程池任务分配、或者打通业务语义（如延时、优先级调度）的时候。阻塞是保证计算机资源不被无缘无故白白消耗的最有效手段。
 
+
+
+如果操作在几纳秒内就能完成，用 CAS 自旋等待比“挂起线程再唤醒（需耗时微秒级）”快得多；如果长时间抢不到，CPU 飙高，有的抢锁循环里spin 次数达到一定程度后用 Thread.yield()来让出 cpu
+    代表是ConcurrentLinkedQueue / 原子类（AtomicInteger）
+
+但如果操作需要几毫秒甚至更久，不停 CAS 会白白把 CPU 拉满，此时必须用 AQS 把线程挂起，把 CPU 资源让出来。 但代价是线程上下文切换的开销（上下文切换需耗时微秒级，涉及用户态/内核态切换）
+    代表是ReentrantLock / ArrayBlockingQueue (AQS)  比如队列没有数据， pool 数据就得阻塞，不能一直尝试拿锁。
+
+混合代表是 ConcurrentHashMap（java 1.8 +）----- CAS + synchronized
+    1.无锁 CAS 场景（极轻量）：当向数组插入节点，且该 Hash 槽为空（tabAt == null）时，直接使用 CAS 原子写入，没有任何锁和阻塞操作。
+    2.锁阻塞场景（哈希冲突/链表/红黑树）：当发现 Hash 槽已经有节点时，它会使用 synchronized 锁住该槽位的头节点（Head Node）。
+        2.1  不用 CAS： 当哈希冲突严重时，需要遍历链表、插入尾部、或者在红黑树上进行旋转和平衡操作。这不再是几纳秒能搞定的操作，不能无脑 CAS 自旋，必须把后续争抢同一个槽位的线程阻塞挂起
+        2.2  不用AQS 的原因：
+                2.2.1  如果用 AQS， 当 hash 槽冲突很多的时候，每个槽的 synchronized（头结点的Mark Word，不用开销）都要换成 AQS， 这样就有大量的 AQS node 开销
+                2.2.2 map 操作不需要tryLock / timeout/Thread.interrupt() 中断 / 多 condition 的情况，
+                2.2.3  JVM 优化后 无竞争或低竞争场景下，synchronized 的性能完全不输甚至略优于 AQS。高竞争（重量级锁 vs AQS 阻塞）性能差不多。
 
 
 ###场景题

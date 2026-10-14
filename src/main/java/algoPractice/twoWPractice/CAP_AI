@@ -1,0 +1,16 @@
+#### CAP  Consistency Availability Partition tolerance
+CAP 里的 P = Partition tolerance，网络分区容忍性, 分区已经发生, 节点之间无法通信。 不是“多副本”。
+实际分布式系统里，P 通常被认为是必须的，真正取舍的是 C 和 A。
+如果保 C：不能确认数据是否同步成功，就可能拒绝请求或阻塞，牺牲 A。
+如果保 A：每个节点都继续响应，但可能返回旧数据，产生不一致，牺牲 C。
+
+BASE： Basically Available, Soft state, Eventual consistency   Soft state = 软状态 / 柔性状态 ， 允许临时不一致，中间态， 但最终要一致
+
+
+Agent = LLM (大脑) + Harness (躯干与工具套件)。
+
+1. 上下文与 Prompt 管理 。 比如 SystemMSG ， AIMessage， UserMsg 拼装
+2. 工具与沙箱调用（Tool Use & Sandbox）：提供终端执行（Bash）、文件读写、浏览器操作、代码解释器等物理接口。
+3. 工作流与控制循环（Control Loop）
+4. 状态与记忆持久化：管理对话 Memory、状态恢复、Session 保存。
+5. 安全与权限控制
