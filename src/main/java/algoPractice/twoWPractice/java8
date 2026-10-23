@@ -1,0 +1,67 @@
+### Java 8 奠定了 函数式编程 和 异步响应式 的基础。   Java 17 (LTS) 依靠 Record + var + 模式匹配 + 文本块 彻底清理了 Java 传统“冗长笨重”的语法刻板印象。 
+###  Java 21 (LTS) 的 虚拟线程 则直接将 Java 的高并发性能提升到了新的维度。  
+
+1,Optional<T> 类
+2,使用 LocalDate、LocalTime、LocalDateTime、Instant 和 Duration。它们是不可变且线程安全的，成为现代 Java 处理时区和时间计算的标准方案。
+3,接口的默认方法与静态方法 (default / static method)
+   3.1 default 方法让接口可以加新的功能，旧版本存在的子类不用实现。 default void forEach(Consumer<? super T> action) 方法，使得所有 Collection 实现类（如 ArrayList, HashSet）瞬间拥有了 forEach 遍历能力，且完全没有破坏任何第三方自定义集合类。
+   3.2 允许接口定义 static 方法后，接口不仅能定义规范，还能直接提供与该接口相关的工具方法和工厂方法。
+    以前 Collection 需要 Collections 工具类。 现在接口就可以做。Stream.of(1, 2, 3) 接口静态方法来创建实例。
+
+    public interface Comparator<T> {
+        int compare(T o1, T o2);
+
+        // Java 8 允许在接口中直接写 static 工具/工厂方法
+        public static <T, U extends Comparable<? super U>> Comparator<T> comparing(
+                Function<? super T, ? extends U> keyExtractor) {
+            Objects.requireNonNull(keyExtractor);
+            return (c1, c2) -> keyExtractor.apply(c1).compareTo(keyExtractor.apply(c2));
+        }
+    }
+
+4,方法引用 (Method References) Class::method , object::method
+5,Stream、CompletableFuture 和 Lambda/函数式编程 
+
+
+### 8++
+1, 虚拟线程 (Virtual Threads) —— Java 21，
+2, Record 类 (数据载体) —— Java 16   // public record UserDto(String name, Integer age, String email) {}
+3, 模式匹配 (Pattern Matching) + 密封类 (Sealed Classes) —— Java 17 & 21
+    // switch 直接支持类型匹配和解构，且 compiler 会检查是否覆盖了所有 Sealed 子类
+        String result = switch (shape) {
+        case Circle(double r) -> "圆面积: " + Math.PI * r * r;
+        case Rectangle(double w, double h) -> "长方形面积: " + w * h;
+    };
+4, 局部变量类型推导 var —— Java 10
+    // 以前：Map<String, List<UserDto>> userMap = new HashMap<String, List<UserDto>>();
+    // 现在：var userMap = new HashMap<String, List<UserDto>>();
+5, 文本块 (Text Blocks) —— Java 15 """xxxx """  可多行
+6，JPMS 模块化系统 (Java Platform Module System) —— Java 9  引入 module-info.java，将 JDK 和用户代码模块化，强行封装 JDK 内部私有 API。
+
+
+
+### 例子 虚拟线程结合 SEMPHORE
+public class RateLimitDemo {
+    // 限制同时访问数据库的虚拟线程最多只有 50 个
+    private static final Semaphore DB_LIMITER = new Semaphore(50);
+
+    public void process() {
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i < 10000; i++) {
+                executor.submit(() -> {
+                    DB_LIMITER.acquire(); // 拿到信号量才允许执行 SQL
+                    try {
+                        return queryDatabase();
+                    } finally {
+                        DB_LIMITER.release();
+                    }
+                });
+            }
+        }
+    }
+}
+
+
+### 
+try-with-resources 语法是 Java 7 引入的， 只要一个类实现了 java.lang.AutoCloseable 接口（或其子接口 Closeable），就可以放入 try(...) 的括号中
+编译器在编译时会自动把这段代码转换为带有 try-finally 的字节码，在离开作用域时自动调用 .close()。但是直到 Java 19 配合虚拟线程推出时，才让 ExecutorService 正式实现了 AutoCloseable 接口

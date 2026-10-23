@@ -122,3 +122,99 @@ mysql怎么解决幻读：
     3.2 同理，第一次是快照读， 后面别的事务提交不可见， 第二次采用当前读，数据就可见了。 
 
 
+Mysql 的标准或者默认隔离级别是 Repeatable Read，只是它比标准做了增强，能解决大部分幻读：
+脏读： 能读到未提交的更改。
+不可重复读： 针对的是已经读取过的“某一行记录“。你读取了它，别人改了它（UPDATE）并提交，你再次读取时内容变了
+幻读：它指由于其他事务的介入，导致你用同一个条件（WHERE 子句）去检索时，查出来的“记录集合（多少行）”发生了变化
+        举个 UPDATE 导致幻读的例子：你在事务 A 中执行 SELECT * FROM user WHERE status = 1，查到了 5 个人。
+        此时事务 B 把另一个 status = 0 的用户修改（UPDATE）成了 status = 1 并提交。
+        当你事务 A 再次执行 SELECT * FROM user WHERE status = 1 时，发现变成了 6 个人——虽然没有人做 INSERT，但凭空多出了一条记录（幽灵/幻觉），这在现代理论中也是标准的幻读
+
+
+
+
+####### SQL 函数 lead/lag  
+## 语法： 
+LEAD(expression, [offset], [default]) OVER (
+    [PARTITION BY partition_expression]
+    ORDER BY sort_expression [ASC | DESC]
+)
+
+
+
+WITH monitored_transactions AS (
+    -- 1. Filter completed transactions for monitored IBANs
+    SELECT 
+        t.sender,
+        CAST(t.dt AS TIMESTAMP) AS txn_time
+    FROM transactions t
+    INNER JOIN monitor m ON t.sender = m.iban
+    WHERE LOWER(t.completed) = 'yes'
+),
+flagged_breaks AS (
+    -- 2. Detect gaps greater than 24 hours (86,400 seconds)
+    SELECT 
+        sender,
+        txn_time,
+        CASE 
+            WHEN LAG(txn_time) OVER (PARTITION BY sender ORDER BY txn_time) IS NULL THEN 1
+            WHEN txn_time - LAG(txn_time) OVER (PARTITION BY sender ORDER BY txn_time) > INTERVAL '24 hours' THEN 1
+            ELSE 0
+        END AS is_new_sequence
+    FROM monitored_transactions
+),
+grouped_sequences AS (
+    -- 3. Assign unique sequence IDs via running cumulative sum
+    SELECT 
+        sender,
+        txn_time,
+        SUM(is_new_sequence) OVER (PARTITION BY sender ORDER BY txn_time) AS seq_id
+    FROM flagged_breaks
+),
+sequence_metrics AS (
+    -- 4. Calculate length per sequence; filter for length >= 2
+    SELECT 
+        sender,
+        seq_id,
+        COUNT(*) AS seq_length
+    FROM grouped_sequences
+    GROUP BY sender, seq_id
+    HAVING COUNT(*) >= 2
+)
+-- 5. Format final output aggregations
+SELECT 
+    sender,
+    STRING_AGG(seq_length::TEXT, ',' ORDER BY seq_length DESC) AS sequences_lengths,
+     -- mysql 用 GROUP_CONCAT(seq_length ORDER BY seq_length DESC SEPARATOR ',') AS sequences_lengths
+    SUM(seq_length) AS sequences_total
+FROM sequence_metrics
+GROUP BY sender
+ORDER BY sequences_total DESC;
+
+
+### CONCAT
+-- PostgreSQL / MySQL 均支持
+SELECT CONCAT('Hello', ' ', 'World'); 
+-- 结果: 'Hello World'
+
+-- 处理 NULL 时（PostgreSQL 优势）
+SELECT CONCAT('User: ', NULL, 'Admin'); 
+-- PostgreSQL 结果: 'User: Admin' (忽略 NULL)
+-- MySQL 结果: NULL 
+
+
+### CONCAT With Separator 
+-- PostgreSQL / MySQL 均支持
+SELECT CONCAT_WS('-', '2026', '10', '23');
+-- 结果: '2026-10-23'
+
+SELECT CONCAT_WS(',', 'A', NULL, 'B');
+-- 结果: 'A,B' (自动跳过 NULL，不会多出一个逗号)
+
+
+#### ROW_NUMBER
+RANK()（稀疏/有跳跃）：如果是第 1 名、第 1 名（并列），接下来就是 第 3 名（跳过了 2）。
+
+DENSE_RANK()（紧密/无跳跃）：如果是第 1 名、第 1 名（并列），接下来依然是 第 2 名。序号永远是紧密连续的（1, 1, 2, 3...），这就是为什么叫 Dense（紧密的）。
+
+ROW_NUMBER() orderby 的值相等也会分不同的名次。

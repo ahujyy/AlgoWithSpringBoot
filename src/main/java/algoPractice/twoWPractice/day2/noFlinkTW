@@ -210,8 +210,12 @@ public class AntiFraudCaffeineFDS {
 }
 
 
-2，Flink 版，绝对不要用 flink 的 timewindow ，太笨重，都受 flink 管理，默认是 rockDB，会撑爆。  还是利用环形数组来解决时间窗口。把计数放到 state 里去受 flink 管理，这样 checkpoint 可以
+2，Flink 版，绝对不要用 flink 的 timewindow ，太笨重，都受 flink 管理，默认是 rockDB，会撑爆(其实可以刷盘)。  还是利用环形数组来解决时间窗口。把计数放到 state 里去受 flink 管理，这样 checkpoint 可以
     使得程序更加健壮，keyby 操作让特定的用户和 product 在同一个实例，流式又使得计数没有竞争。缺点是延迟大于 RPC 版本，不能实时。
+
+##### 这里实现没有考虑到原生 timewindow 方案里的 watermark 支持， 比如：当新事件从数组的一个 slot 切换到 下一个 slot，也就是 index +1， 表明数据过了一个timewindow 的步长，
+##### 新的一个timewindow 形成了， 需要统计里面所有数据，如果立马统计，就是不支持迟到数据统计，没有 watermark 概念。 另外新的事件来了，直接找到对应的槽位，把里面的值加 1，这样也
+#### 没有区分是不是上轮留下的值。 这里每个事件来了就统计整个区间，不是按步长到了尾部再统计。
 
 
 StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();

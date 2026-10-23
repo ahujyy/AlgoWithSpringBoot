@@ -298,3 +298,126 @@ Redis 重入锁：
             // 将多个锁合并为一个大锁，同时成功才算成功
             RLock multiLock = redissonClient.getMultiLock(lock1, lock2);
             multiLock.lock();
+
+
+######################################################################## -------------- ###############################################################
+########################################################################  SingleFlight ################################################################
+######################################################################## -------------- ###############################################################
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
+
+public class SingleFlight {
+    // 存放正在进行的请求 Task
+    private final ConcurrentHashMap<String, CompletableFuture<Object>> futures = new ConcurrentHashMap<>();
+
+    @SuppressWarnings("unchecked")
+    public <T> T execute(String key, Supplier<T> dbLoader) {
+        // 利用 computeIfAbsent 的原子性：同一时间对于相同的 key，dbLoader 只会被封装并放入一次
+        CompletableFuture<Object> future = futures.computeIfAbsent(key, k -> {
+            CompletableFuture<Object> newFuture = new CompletableFuture<>();
+            // 异步或同步执行真正的加载逻辑
+            try {
+                T result = dbLoader.get();
+                newFuture.complete(result);
+            } catch (Throwable t) {
+                newFuture.completeExceptionally(t);
+            }
+            return newFuture;
+        });
+
+        try {
+            // 所有等待该 key 的线程都会阻塞在 future.get() 上，共享同一个返回值
+            return (T) future.get();
+        } catch (Exception e) {
+            throw new RuntimeException("SingleFlight execution failed", e);
+        } finally {
+            // 执行完毕后，及时移除 key，确保下一次过期的请求能重新触发加载
+            futures.remove(key, future);
+        }
+    }
+}
+
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface SingleFlightCache {
+    String key(); // 支持 SpEL 表达式，如 'user:' + #id
+    int expireSeconds() default 60;
+}
+
+
+@Aspect
+@Component
+public class SingleFlightAspect {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private Cache<String, Object> caffeineCache; // 本地 Caffeine 实例
+
+    private final SingleFlight singleFlight = new SingleFlight();
+
+    @Around("@annotation(sfCache)")
+    public Object around(ProceedingJoinPoint joinPoint, SingleFlightCache sfCache) throws Throwable {
+        // 1. 解析 SpEL 获取动态 Key
+        String key = parseSpEL(joinPoint, sfCache.key());
+
+        // 2. 查询 L1 缓存 (Caffeine)
+        Object value = caffeineCache.getIfPresent(key);
+        if (value != null) {
+            return value;
+        }
+
+        // 3. 查询 L2 缓存 (Redis)
+        value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            caffeineCache.put(key, value); // 补写 L1
+            return value;
+        }
+
+        // 4. L1/L2 均 Miss，触发 SingleFlight 合并并发请求去查 DB/执行原方法
+        value = singleFlight.execute(key, () -> {
+            try {
+                // 双重检查（Double-Check）：防止前一个线程刚回写完缓存，后续拿到 SingleFlight 锁的线程重复查 DB
+                Object reCheck = redisTemplate.opsForValue().get(key);
+                if (reCheck != null) {
+                    return reCheck;
+                }
+
+                // 执行真正的 Service 方法（如查数据库）
+                Object dbResult = joinPoint.proceed();
+
+                if (dbResult != null) {
+                    // 回写 Redis 与 Caffeine
+                    redisTemplate.opsForValue().set(key, dbResult, sfCache.expireSeconds(), TimeUnit.SECONDS);
+                    caffeineCache.put(key, dbResult);
+                }
+                return dbResult;
+            } catch (Throwable e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        return value;
+    }
+
+    private String parseSpEL(ProceedingJoinPoint joinPoint, String spelStr) {
+        // 标准 Spring SpEL 解析逻辑 (此处略)
+        return spelStr; 
+    }
+}
+
+
+@Service
+public class UserService {
+
+    // 当 1000 个并发请求同时调用 getUserById(101) 时：
+    // 切面会先查 Caffeine/Redis；若失效，SingleFlight 保证 proceed() (查 DB) 只被触发 1 次！
+    // 剩下的 999 个请求会挂起等待，直接共享这 1 次查 DB 的结果并返回。
+    @SingleFlightCache(key = "'user:' + #id", expireSeconds = 120)
+    public UserVO getUserById(Long id) {
+        return userMapper.selectById(id); // 真正查 DB
+    }
+}

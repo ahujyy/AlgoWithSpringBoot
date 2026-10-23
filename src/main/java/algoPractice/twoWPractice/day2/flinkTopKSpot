@@ -1,91 +1,279 @@
 #### 计算实时 Top K 热点
-1，先用
 
-clicks
-    .keyBy(event -> event.productId)
-    .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5)))
-    .aggregate(
-        new AggregateFunction<ClickEvent, Long, Long>() {
-            @Override public Long createAccumulator() { return 0L; }
-            @Override public Long add(ClickEvent value, Long acc) { return acc + 1; }
-            @Override public Long getResult(Long acc) { return acc; }
-            @Override public Long merge(Long a, Long b) { return a + b; }
-        },
-        new ProcessWindowFunction<Long, String, String, TimeWindow>() {
-          
-        }
-    )
+###  知识点：
+state 绑定在当前 Subtask（算子实例）上、并且严格按 Key 隔离”的托管状态（Managed State），不是全局的。
+和算子的普通变量的区别：
+1，可恢复： Flink State  Flink 会定期把状态做快照（Checkpoint）持久化到远端存储（如 HDFS / OSS）
+2，避免内存 OOM，Flink State如果配合 RocksDB 状态后端，Flink 可以把海量的 state数据自动序列化并溢写到本地 SSD 磁盘上。内存里只保留热点索引，能够支撑 TB 级别的大状态。
+3，自动生命周期管理。Flink 框架会自动帮你管理 Key 的隔离。当当前的 Key（比如某个 windowEnd）处理完后，配合 Flink 的 TTL（生存时间）或手动 clear()，框架会安全地回收资源。
 
+timeservice 也是绑定在当前 Subtask（算子实例）上。 
+
+
+
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
+
+import java.time.Duration;
 import java.util.*;
 
-/**
- * 输入数据格式：WindowResult (skuId, clickCount, windowEnd)
- */
-public class TopNKeyedProcessFunction extends KeyedProcessFunction<Long, WindowResult, String> {
+public class FlinkTwoStageTopNJob {
 
-    // 真正硬核的状态：用来缓存当前这个窗口时间（windowEnd）下，所有 Sku 的点击量快照
-    // 它是免死金牌，防止节点挂了堆内存丢失
-    private transient MapState<String, Long> skuSizeState;
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(4);
+        env.getConfig().setAutoWatermarkInterval(200); // 默认也是 200ms 生成 watermark
 
-    @Override
-    public void open(Configuration parameters) {
-        skuSizeState = getRuntimeContext().getMapState(
-            new MapStateDescriptor<>("sku-size-state", String.class, Long.class)
-        );
+        // 1. 读取数据流并分配 Watermark
+        DataStream<ClickEvent> clickStream = env.addSource(new MockClickEventSource())
+                .assignTimestampsAndWatermarks(
+                        org.apache.flink.api.common.eventtime.WatermarkStrategy
+                                .<ClickEvent>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+                                .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+                );
+
+        // =====================================================================
+        // 阶段一：按 SKU 分流 -> 1小时滑动窗口（5分钟步长） -> 增量聚合
+        // =====================================================================
+        DataStream<WindowResult> windowResultStream = clickStream
+                .keyBy(ClickEvent::getProductId)
+                .window(SlidingEventTimeWindows.of(Time.hours(1), Time.minutes(5))) // 一个事件属于 60/5=12 个时间窗口。
+                .aggregate(new SkuAggregator(), new SkuWindowResultFunction()); 
+                // 只有当前算子的 watermark > 1 小时窗口中（12 个） 最小end 时间（假设 T）时，触发SkuWindowResultFunction计算
+                // 只有这个算子所属（被 keyby 所分）的所有 SKU 的统计 click 数转换成WindowResult后， 这个 watermark 才会转给下游LocalTopNProcessFunction
+                //LocalTopNProcessFunction只有处理完这些WindowResult后，才会碰到上游给的新的 watermark ，而这个 watermark大于 windowEnd T， 
+                // timer 注册的事件windowEndT +1 ， watermark大于 >= T+1， 触发 timeron 逻辑，其实 这个+1 毫秒我觉得是防御编程， 既然前面该时间窗口内的WindowResult都处理完了
+                // 当前算子才碰到该 watermark， 而对 state 操作是同步的， 所以state 更新都已经完成了， 没有必要再等了。你加多了毫秒数反而有可能导致下一个 watermark 才大于注册时间，导致晚处理。
+
+        // =====================================================================
+        // 阶段二：Local TopN（局部粗筛）- 加盐分桶并行计算各桶 Top 10
+        // =====================================================================
+        DataStream<WindowResult> localTopNStream = windowResultStream
+                .keyBy(r -> {
+                    // 加盐分桶：将同一个 windowEnd 的 SKU 按哈希打散到 5 个不同的并行桶中
+                    int salt = Math.abs(r.getSkuId().hashCode()) % 5;
+                    return r.getWindowEnd() + "_" + salt;
+                }, Types.STRING)
+                .process(new LocalTopNProcessFunction(10));
+
+        // =====================================================================
+        // 阶段三：Global TopN（全局精排）- 汇聚各盐桶候选者，算出最终 Top 10
+        // =====================================================================
+        DataStream<String> globalTopNStream = localTopNStream
+                .keyBy(WindowResult::getWindowEnd, Types.LONG) // 此时数据量极小（仅并行度 * 10），汇聚到单机安全
+                .process(new GlobalTopNProcessFunction(10));
+
+        globalTopNStream.print();
+
+        env.execute("Flink Two-Stage Salting TopN");
     }
 
-    @Override
-    public void processElement(WindowResult input, Context ctx, Collector<String> out) throws Exception {
-        // 1. 将当前窗口发来的各个 Sku 数据，暂存到 Flink 状态里
-        skuSizeState.put(input.getSkuId(), input.getClickCount());
+    // =========================================================================
+    // 数据结构定义
+    // =========================================================================
 
-        // 2. 注册一个 1 毫秒后的定时器。
-        // 为什么要注册定时器？为了等这个窗口里的所有 Sku 数量“到齐了”，再统一用堆排序，避免来一条算一条。
-        ctx.timerService().registerEventTimeTimer(input.getWindowEnd() + 1);
+    public static class ClickEvent {
+        public String productId;
+        public long timestamp;
+        public ClickEvent() {}
+        public ClickEvent(String productId, long timestamp) {
+            this.productId = productId;
+            this.timestamp = timestamp;
+        }
+        public String getProductId() { return productId; }
+        public long getTimestamp() { return timestamp; }
     }
 
-    @Override
-    public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
-        long windowEnd = ctx.getCurrentKey(); // 当前触发的窗口结束时间
+    public static class WindowResult {
+        private String skuId;
+        private long clickCount;
+        private long windowEnd;
 
-        // 3. 构建一个 Java 原生的最小堆（PriorityQueue 默认是最小堆，堆顶是小元素）
-        // 里面存的就是 Top 10 的 SKU 实体
-        PriorityQueue<WindowResult> minHeap = new PriorityQueue<>(10, Comparator.comparingLong(WindowResult::getClickCount));
+        public WindowResult() {}
+        public WindowResult(String skuId, long clickCount, long windowEnd) {
+            this.skuId = skuId;
+            this.clickCount = clickCount;
+            this.windowEnd = windowEnd;
+        }
 
-        // 4. 遍历状态，把所有的 SKU 往最小堆里塞
-        Iterable<Map.Entry<String, Long>> allSkus = skuSizeState.entries();
-        for (Map.Entry<String, Long> entry : allSkus) {
-            WindowResult item = new WindowResult(entry.getKey(), entry.getValue(), windowEnd);
-            
-            if (minHeap.size() < 10) {
-                // 堆没满，直接塞
-                minHeap.add(item);
-            } else if (item.getClickCount() > minHeap.peek().getClickCount()) {
-                // 超过了堆顶的“守门员”，把守门员踢走，自己进去
-                minHeap.poll();
-                minHeap.add(item);
+        public String getSkuId() { return skuId; }
+        public long getClickCount() { return clickCount; }
+        public long getWindowEnd() { return windowEnd; }
+    }
+
+    // =========================================================================
+    // 阶段一相关函数
+    // =========================================================================
+
+    public static class SkuAggregator implements AggregateFunction<ClickEvent, Long, Long> {
+        @Override public Long createAccumulator() { return 0L; }
+        @Override public Long add(ClickEvent value, Long acc) { return acc + 1L; }
+        @Override public Long getResult(Long acc) { return acc; }
+        @Override public Long merge(Long a, Long b) { return a + b; }
+    }
+
+    public static class SkuWindowResultFunction extends ProcessWindowFunction<Long, WindowResult, String, TimeWindow> {
+        @Override
+        public void process(String skuId, Context context, Iterable<Long> elements, Collector<WindowResult> out) { // 只有到了一个时间窗口结束时间的 watermark喷出才会执行
+            out.collect(new WindowResult(skuId, elements.iterator().next(), context.window().getEnd()));
+        }
+    }
+
+    // =========================================================================
+    // 阶段二：Local TopN 处理函数（加盐桶内部用最小堆筛选局部 Top 10）
+    // =========================================================================
+    public static class LocalTopNProcessFunction extends KeyedProcessFunction<String, WindowResult, WindowResult> {
+        private final int topSize;
+        private transient MapState<String, Long> localSkuState;
+
+        public LocalTopNProcessFunction(int topSize) { this.topSize = topSize; }
+
+        @Override
+        public void open(Configuration parameters) {
+            localSkuState = getRuntimeContext().getMapState(
+                    new MapStateDescriptor<>("local-sku-state", Types.STRING, Types.LONG)
+            );
+        }
+
+        @Override
+        public void processElement(WindowResult input, Context ctx, Collector<WindowResult> out) throws Exception {
+            localSkuState.put(input.getSkuId(), input.getClickCount());
+            // 延迟 1ms 确保数据全部到达后触发
+            ctx.timerService().registerEventTimeTimer(input.getWindowEnd() + 1);
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<WindowResult> out) throws Exception {
+            String compositeKey = ctx.getCurrentKey(); // 格式: windowEnd_salt
+            long windowEnd = Long.parseLong(compositeKey.split("_")[0]);
+
+            PriorityQueue<WindowResult> minHeap = new PriorityQueue<>(
+                    topSize, Comparator.comparingLong(WindowResult::getClickCount)
+            );
+
+            for (Map.Entry<String, Long> entry : localSkuState.entries()) {
+                WindowResult item = new WindowResult(entry.getKey(), entry.getValue(), windowEnd);
+                if (minHeap.size() < topSize) {
+                    minHeap.add(item);
+                } else if (item.getClickCount() > minHeap.peek().getClickCount()) {
+                    minHeap.poll();
+                    minHeap.add(item);
+                }
+            }
+
+            // 将当前盐桶选出的局部 Top N 向下游发射
+            for (WindowResult result : minHeap) {
+                out.collect(result);
+            }
+
+            localSkuState.clear();
+        }
+    }
+
+    // =========================================================================
+    // 阶段三：Global TopN 处理函数（汇聚所有盐桶的局部 Top N，算出最终全局结果）
+    // =========================================================================
+    public static class GlobalTopNProcessFunction extends KeyedProcessFunction<Long, WindowResult, String> {
+        private final int topSize;
+        private transient MapState<String, Long> globalSkuState;
+
+        public GlobalTopNProcessFunction(int topSize) { this.topSize = topSize; }
+
+        @Override
+        public void open(Configuration parameters) {
+            globalSkuState = getRuntimeContext().getMapState(
+                    new MapStateDescriptor<>("global-sku-state", Types.STRING, Types.LONG)
+            );
+        }
+
+        @Override
+        public void processElement(WindowResult input, Context ctx, Collector<String> out) throws Exception {
+            // 由于不同盐桶可能包含同一个 SKU 的不同历史版本（虽然基于相同 windowEnd），取最大值或直接覆盖
+            globalSkuState.put(input.getSkuId(), input.getClickCount());
+            ctx.timerService().registerEventTimeTimer(input.getWindowEnd() + 2); // 稍晚 1ms 触发，确保局部数据全到
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
+            long windowEnd = ctx.getCurrentKey();
+
+            PriorityQueue<WindowResult> minHeap = new PriorityQueue<>(
+                    topSize, Comparator.comparingLong(WindowResult::getClickCount)
+            );
+
+            for (Map.Entry<String, Long> entry : globalSkuState.entries()) {
+                WindowResult item = new WindowResult(entry.getKey(), entry.getValue(), windowEnd);
+                if (minHeap.size() < topSize) {
+                    minHeap.add(item);
+                } else if (item.getClickCount() > minHeap.peek().getClickCount()) {
+                    minHeap.poll();
+                    minHeap.add(item);
+                }
+            }
+
+            List<WindowResult> resultList = new ArrayList<>(minHeap);
+            resultList.sort((o1, o2) -> Long.compare(o2.getClickCount(), o1.getClickCount()));
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== 窗口: ").append(new Date(windowEnd)).append(" 全局最终 Top ").append(topSize).append(" ===\n");
+            for (int i = 0; i < resultList.size(); i++) {
+                WindowResult r = resultList.get(i);
+                sb.append("No.").append(i + 1).append(": SKU=").append(r.getSkuId()).append(", 次数=").append(r.getClickCount()).append("\n");
+            }
+            out.collect(sb.toString());
+
+            globalSkuState.clear();
+        }
+    }
+
+    // 模拟数据源
+    public static class MockClickEventSource implements SourceFunction<ClickEvent> {
+        private volatile boolean running = true;
+        @Override
+        public void run(SourceContext<ClickEvent> ctx) throws Exception {
+            Random random = new Random();
+            while (running) {
+                String skuId = "SKU_" + random.nextInt(100000); // 模拟 10 万个 SKU
+                ctx.collect(new ClickEvent(skuId, System.currentTimeMillis()));
+                Thread.sleep(10);
             }
         }
-
-        // 5. 此时最小堆里留下的，就是真正的全局前 10 名。把它倒序倒出来（变成大到小排列）
-        List<WindowResult> resultList = new ArrayList<>(minHeap);
-        resultList.sort((o1, o2) -> Long.compare(o2.getClickCount(), o1.getClickCount())); // 降序
-
-        // 6. 格式化输出吐给下游（比如 Redis 或者大屏）
-        StringBuilder sb = new StringBuilder();
-        sb.append("=== 窗口结束时间: ").append(new Date(windowEnd)).append(" 的 Top 10 ===\n");
-        for (int i = 0; i < resultList.size(); i++) {
-            WindowResult r = resultList.get(i);
-            sb.append("No.").append(i + 1).append(": Sku=").append(r.getSkuId()).append(", 次数=").append(r.getClickCount()).append("\n");
-        }
-        out.collect(sb.toString());
-
-        // 7. 打扫战场：当前窗口已经结算完毕，把内存状态清空，防止 OOM
-        skuSizeState.clear();
+        @Override public void cancel() { running = false; }
     }
 }
+
+
+------------------------------------- FlinkSQL -------------------------------------
+-- 1. 定义滑动窗口聚合
+WITH WindowAgg AS (
+  SELECT 
+    product_id,
+    COUNT(*) as click_count,
+    HOP_END(row_time, INTERVAL '5' MINUTE, INTERVAL '1' HOUR) as window_end
+  FROM click_stream
+  GROUP BY product_id, HOP(row_time, INTERVAL '5' MINUTE, INTERVAL '1' HOUR)
+),
+
+-- 2. 使用 ROW_NUMBER() 开窗取 Top 10，Flink 会自动优化为两阶段 TopN
+RankedSkus AS (
+  SELECT 
+    product_id,
+    click_count,
+    window_end,
+    ROW_NUMBER() OVER (PARTITION BY window_end ORDER BY click_count DESC) as rn
+  FROM WindowAgg
+)
+
+SELECT * FROM RankedSkus WHERE rn <= 10;
