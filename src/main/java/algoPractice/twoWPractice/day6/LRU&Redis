@@ -93,6 +93,20 @@ Redis 重入锁：
         4.5 不用自己写代码维护没有抢到锁后的自旋抢锁（空耗 cpu）。基于 Redis Pub/Sub 发布订阅机制，无锁等待，性能极高
         4.6 消除因为 master slave 没有同步好，master 挂掉导致双持锁问题。 提供 RedLock 红锁算法 / MultiLock 解决主从异步同步问题
 
+        注意：Redis Pub/Sub 发布订阅机制 指的是 Redis channel，subscribe 一个 key 后， 服务端发现如果没有这个 channel，就会新建, Redis在全局有个 hash 表（不是自身的 hash 数据结构， 不会遵守普通的被剔除或者过期），
+                key 就是 channel 的名称， value 是链表（Linked List），链表中保存了所有当前正在订阅这个 Channel 的客户端（Client 结构体）指针。当要发送消息时，把消息写进链表上每个 Client的
+                输出缓冲区（Output Buffer），由 redis 发送给客户端。这就实现了消息广播。 
+            Redis 的 List 就是一种双向链表,它也可以看作是一个双端队列， 所以能轻松实现 Queue 和 Stack。 
+            Queue 用LPUSH（从左边压入） + BRPOP（从右边阻塞弹出）。 LPUSH（从左边压入） + LPOP（从左边弹出）。 有点像 ArrayDeque， 不过ArrayDeque用了双指针，可以是 Queue 和 Stack。
+            Redis基本结构： String ,List , Set, ZSET, Hash, BitMap, HyperLogLog 还有其他高级结构：
+            GEO ，基于 ZSET（Sorted Set）实现，两点距离计算
+            Stream， 支持 kafka 这种 consumerGroup，Ack 机制， 不过大家仍然选 kafka 等
+            JSON，
+            Time Series (时序数据），
+            Vector Set (向量集)
+
+
+
     5. 代码片段
         5.1 . lua 
             String result = jedis.set(lockKey, requestId, "NX", "EX", 30);

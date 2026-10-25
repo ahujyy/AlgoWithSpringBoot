@@ -10,6 +10,9 @@ state 绑定在当前 Subtask（算子实例）上、并且严格按 Key 隔离�
 timeservice 也是绑定在当前 Subtask（算子实例）上。 
 
 
+watermark 从算子 A 传到 算子 B， 如果 A 的并行度是 2， 而 B 是 4，  每个 B 的实例里有2 个 channel，分别对应 A 的两个实例，比如B的实例 B1 里channel C1 读到了 WatermarkA， C2里
+还没有读到， 那 C1 会暂停处理数据，直到等C2 的 WatermarkA吗
+
 
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.state.MapState;
