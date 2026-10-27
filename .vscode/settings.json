@@ -1,5 +1,5 @@
 {
-    "java.jdt.ls.vmargs": "-XX:+UseZGC -XX:+ZGenerative -Dsun.zip.disableMemoryMapping=true -Xmx4G -Xms100m -Xlog:disable",
+    "java.jdt.ls.vmargs": "-XX:+UseZGC -XX:+ZGenerational -Xmx2G -Xms512m",
     "java.import.gradle.enabled": true,
     "java.configuration.updateBuildConfiguration": "automatic",
     
