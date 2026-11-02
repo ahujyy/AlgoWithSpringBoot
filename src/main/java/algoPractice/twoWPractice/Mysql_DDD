@@ -218,3 +218,57 @@ RANK()（稀疏/有跳跃）：如果是第 1 名、第 1 名（并列），接�
 DENSE_RANK()（紧密/无跳跃）：如果是第 1 名、第 1 名（并列），接下来依然是 第 2 名。序号永远是紧密连续的（1, 1, 2, 3...），这就是为什么叫 Dense（紧密的）。
 
 ROW_NUMBER() orderby 的值相等也会分不同的名次。
+
+
+########################################## Hibernate ######################
+Hibernate 通过 Session（对应 JPA 的EntityManager） 来操作 Entity， 他们对应的 “管理器”（SessionFactory vs EntityManagerFactory）
+Session 对应 Entity操作一般是先查询，然后在更改，Sesion 后续会刷回 DB。 如果是原子性更改，就有并发性风险，常用解决方案：
+1， Redis 分布式锁。 缺点是，引入了Redis 依赖和维护， 所有的并发必须要从 Redis 拿锁
+2， Hibernate 在 Entity 里用 @Version 修饰一个 DB 里专门做版本的字段，更改的时候会在 where 里 versionField= oldVersion. 乐观锁方案。
+    缺点是： 其他地方改数据的应用也需要遵守更新数据的同时也需要更新 version 字段。 并且额外要维护一个版本字段。 
+3， 悲观锁方案， 让 SQL 生成 带 for update的语句： SELECT ... FOR UPDATE， 从而读的时候拿到临键锁。
+    Account account = entityManager.find(
+        Account.class, 
+        accountId, 
+        LockModeType.PESSIMISTIC_WRITE 
+    ); 
+    缺点是： 要小心事务不能非常耗时 加 高并发，这样锁被占久了影响性能，导致阻塞或者DB 链接超载。
+4， 充分利用数据的锁能力，用 JPQL
+    @Modifying
+    @Query("UPDATE Account a SET a.balance = a.balance + :amount WHERE a.id = :id")
+    int updateBalance(@Param("id") Long id, @Param("amount") BigDecimal amount);
+    缺点是： 功能比较简单单一。 把核心任务做成这种放在事务里，比较推荐。 如 DB 压力大，可以考虑 Redis 方案。
+
+有Spring @Transactional 后， 就不用管 session 的开闭和提交了， Spring 代理托管了。
+否则得写这种原生代码：
+// 1. 初始化 SessionFactory（通常是单例全局共享）
+        SessionFactory factory = new Configuration().configure().buildSessionFactory();
+
+// 2. 使用 try-with-resources 自动关闭 Session
+        try (Session session = factory.openSession()) {
+            // 3. 开启事务
+            session.beginTransaction();
+
+            try {
+                // 执行业务操作（例如查询或保存）
+                User user = session.get(User.class, 1L);
+                System.out.println(user.getName());
+
+                // 4. 提交事务
+                session.getTransaction().commit();
+            } catch (Exception e) {
+                // 异常时回滚事务
+                session.getTransaction().rollback();
+                throw e;
+            }
+        } // 离开作用域时，session.close() 会被自动调用，一级缓存销毁
+
+
+Hibernate 一级缓存是与单个 Session 绑定且默认开启的事务级缓存，而二级缓存则是跨 Session 共享、需要显式配置的应用级全局缓存，比如用 redis， 基本不用。
+JPQL （Java Persistence Query Language) 注意点：
+1， 查询本身不走一级缓存
+    session.get() 或 entityManager.find()（通过主键查询）时，Hibernate 会先去一级缓存（Map）里找，找不到才查数据库
+    如 SELECT u FROM User u WHERE u.age > 18 无论如何都会向数据库发送一条真实的 SQL，不会去一级缓存里“检索”满足条件的对象集合
+2， JPQL 会影响缓存：
+    2.1 执行 JPQL 本身的 session 会在执行前 flush，确保最新的改动刷到 DB， JPQL 能查询到。
+    2.2  查询后，如果一级缓存没有，会自动放进去， 如果有重复的一模一样的，会丢弃查回来的，复用原来在缓存的（这里虽然查了缓存，是先查了 db 后做比较）。

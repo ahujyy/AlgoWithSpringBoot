@@ -3,7 +3,9 @@ package algoPractice.addtionalPractice;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class CompactorPractice {
 
@@ -86,6 +88,18 @@ public class CompactorPractice {
 
 
 
+        Map<Integer,Integer> mapInt = new HashMap<Integer,Integer>();
+        List<Map.Entry<Integer, Integer>> entriesList = new ArrayList<>();
+        entriesList.addAll(mapInt.entrySet());
+
+        entriesList.sort( (Map.Entry<Integer, Integer> a, Map.Entry<Integer, Integer> b) -> {
+            if(!a.getValue().equals(b.getValue())){
+                return b.getValue().compareTo(a.getValue()); // 按 value 降序排列
+            }else{
+                return a.getKey().compareTo(b.getKey()); // value 相等，按key 升序。
+            }
+
+        });
         
 
     }
